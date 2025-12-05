@@ -324,7 +324,7 @@ class MeanMapper(torch.nn.Module):
         进行自适应平均池化处理，将特征映射为指定维度。
         输入:
             features: Tensor
-                形状类似 [N, ...]，第 0 维是样本数（batchsize），其余维度会全部展平。
+                形状类似 [N, ...]，第 0 维是patch数（B*Gh_ref*Gw_ref），其余维度会全部展平。
         流程:
             1. reshape 为 [N, 1, D']，D' = 其余所有维度展平后的长度；
             2. 对长度为 D' 的序列做自适应平均池化，输出长度为 preprocessing_dim；
