@@ -1,0 +1,6 @@
+__pycache__/
+output_images*
+models/*
+Report
+visualization
+adaption
