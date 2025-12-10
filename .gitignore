@@ -1,6 +1,13 @@
 __pycache__/
-output_images*
-models/*
-Report
+
+requirements.txt
 visualization
 adaption
+
+# 文件夹
+runs/*
+models/*
+Report/*
+memorybanks/*
+classifier/*
+output_images/*

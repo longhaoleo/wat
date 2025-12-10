@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
+from patchcore.sampler import BaseSampler
+
 METRIC = "l2"
 
 
@@ -19,6 +21,88 @@ def _l2_normalize_np(x, eps=1e-12):
     n = np.linalg.norm(x, axis=1, keepdims=True)   # 按行求范数
     n = np.maximum(n, eps)
     return x / n
+
+
+class PCASampler(BaseSampler):
+    """
+    基于 PCA 的特征采样器：
+      - 对特征做 PCA/SVD 分解，在主成分空间中计算每个样本的“能量”（前 k 个主成分系数的范数）；
+      - 按能量从大到小选择前 p% 的样本。
+
+    参数:
+        percentage : float
+            采样比例 (0,1)，即保留样本的比例；
+        n_components : int 或 None
+            在 PCA 空间中使用的主成分个数；
+            为 None 时自动取 min(8, 特征维度)。
+    """
+
+    def __init__(self, percentage: float, n_components: int | None = None):
+        super().__init__(percentage)
+        self.n_components = n_components
+
+    def run(self, features: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+        if self.percentage == 1:
+            return features
+
+        self._store_type(features)
+
+        # 转为 numpy 做 PCA（仅用于计算索引，真正的子集从原始 features 中取）
+        if isinstance(features, torch.Tensor):
+            X = features.detach().cpu().numpy()
+        else:
+            X = np.asarray(features)
+
+        N = X.shape[0]
+        print(f'features number: {N}')
+        if N <= 1:
+            return features
+
+        X = X.reshape(N, -1).astype(np.float32, copy=False)
+
+        # 中心化
+        X_mean = X.mean(axis=0, keepdims=True)
+        X_centered = X - X_mean
+
+        try:
+            # SVD: X_centered = U diag(S) V^T
+            U, S, _ = np.linalg.svd(X_centered, full_matrices=False)
+        except Exception:
+            # 数值失败时退化为随机采样
+            print("数值失败时退化为随机采样")
+            n_keep = max(1, int(N * self.percentage))
+            n_keep = min(n_keep, N)
+            idx_fallback = np.random.choice(N, size=n_keep, replace=False)
+            if isinstance(features, torch.Tensor):
+                idx_t = torch.as_tensor(idx_fallback, dtype=torch.long, device=features.device)
+                subset = features.index_select(0, idx_t)
+            else:
+                subset = features[idx_fallback]
+            return self._restore_type(subset)
+
+        # 选取前 k 个主成分
+        k = self.n_components
+        max_k = S.shape[0]
+        if k is None or k <= 0 or k > max_k:
+            k = min(8, max_k)
+
+        # 每个样本在 PCA 空间中的坐标: Z = U * S
+        Z = U[:, :k] * S[:k]
+        scores = np.linalg.norm(Z, axis=1)
+
+        # 选择得分最高的前 p% 样本
+        n_keep = max(1, int(N * self.percentage))
+        n_keep = min(n_keep, N)
+        idx = np.argsort(scores)[-n_keep:]
+
+        # 根据索引从原始特征中取子集（保持类型/设备）
+        if isinstance(features, torch.Tensor):
+            idx_t = torch.as_tensor(idx, dtype=torch.long, device=features.device)
+            subset = features.index_select(0, idx_t)
+        else:
+            subset = features[idx]
+
+        return self._restore_type(subset)
 
 
 #### 近邻匹配 (Faiss近邻搜索)
@@ -47,25 +131,18 @@ class FaissNN(object):
         self.search_index = None   # 实际的 FAISS 索引对象
         self.metric = metric
 
-    def _gpu_cloner_options(self):
-        """构造用于 CPU 索引克隆到 GPU 时的配置对象。"""
-        return faiss.GpuClonerOptions()
-
     def _index_to_gpu(self, index):
         if self.on_gpu:
             return faiss.index_cpu_to_gpu(
-                faiss.StandardGpuResources(),  # GPU 资源句柄
-                0,                              # 使用第 0 号 GPU
-                index,
-                self._gpu_cloner_options(),
+                faiss.StandardGpuResources(), 0, index, self._gpu_cloner_options()
             )
         return index
 
     def _index_to_cpu(self, index):
-        if not self.on_gpu:
-            # 当前模式已是 CPU，直接调用 gpu_to_cpu 是安全的（否则在 GPU 模式下可能无效）
+        if self.on_gpu:
             return faiss.index_gpu_to_cpu(index)
         return index
+
 
     def _create_index(self, dimension):
         """
@@ -267,6 +344,95 @@ class ConcatMerger(_BaseMerger):
                 包含原特征图中所有通道和空间位置的信息。
         """
         return features.reshape(len(features), -1)
+
+
+class PatchGramPreprocessing(torch.nn.Module):
+    def __init__(self, output_dim: int):
+        super(PatchGramPreprocessing, self).__init__()
+        """
+        Patch 级 Gram 特征预处理模块。
+
+        功能：
+            - 输入：来自多个层的 patch 级特征，每个元素形状 [N, C_i, p, p]；
+              其中 N = B * Gh_ref * Gw_ref，是“patch 个数”，每一行对应一个 patch。
+            - 对每个 patch 独立计算通道间的 Gram 矩阵 G_i ∈ R^{C_i×C_i}；
+            - 将 Gram 展平为向量，再用 1D 自适应平均池化映射到固定长度 output_dim；
+            - 最终输出形状 [N, L, output_dim]，L 为使用的层数，与 self.layers_to_extract_from 对齐。
+
+        参数:
+            output_dim : int
+                每个 patch 的 Gram 特征最终压缩到的维度，
+                一般可以设为 pretrain_embed_dimension 或 target_embed_dimension。
+        """
+        self.output_dim = output_dim
+
+    def forward(self, features):
+        """
+        前向传播：对每层的 patch 特征计算 Gram + 池化。
+        输入:
+            features : list[Tensor]
+                长度 = L（层数），第 i 个元素形状为 [N, C_i, p, p]：
+                    N   = B * Gh_ref * Gw_ref（所有图的 patch 总数）
+                    C_i = 第 i 层通道数
+                    p   = patchsize（例如 3）
+        返回:
+            Tensor:
+                形状 [N, L, output_dim]：
+                    N   = patch 数
+                    L   = 层数
+                    output_dim = 每个 patch 的 Gram 向量维度
+        """
+        gram_embeds = []
+
+        for feat in features:
+            # feat: [N, C, p, p]
+            N, C, p_h, p_w = feat.shape
+            P = p_h * p_w                  # patch 内空间位置数 (= p*p)
+
+            # 先在空间维上展平:
+            #   [N, C, p, p] -> [N, C, P]
+            feat_flat = feat.reshape(N, C, P)
+
+            # ========= 通道压缩：C -> C_reduced =========
+            # 这里用自适应平均池化在通道维上做无参数压缩:
+            #   feat_flat:        [N, C, P]
+            #   转置后:           [N, P, C]   （最后一维是通道）
+            #   adaptive_avg_pool1d(..., C_reduced) 在通道维上平均到 32 维
+            #   再转回:           [N, C_reduced, P]
+            C_reduced = min(C, 32)
+            feat_flat_T = feat_flat.transpose(1, 2)          # [N, P, C]
+            feat_flat_T = F.adaptive_avg_pool1d(
+                feat_flat_T, C_reduced
+            )                                                # [N, P, C_reduced]
+            feat_reduced = feat_flat_T.transpose(1, 2)       # [N, C_reduced, P]
+
+            # ========= 在压缩后的通道上算 Gram =========
+            #   G = F_reduced F_reduced^T / P
+            #   feat_reduced:         [N, C_reduced, P]
+            #   feat_reduced^T:       [N, P, C_reduced]
+            #   gram:                 [N, C_reduced, C_reduced]
+            gram = torch.bmm(
+                feat_reduced, feat_reduced.transpose(1, 2)
+            )
+            gram = gram / float(P)                           # 归一化
+
+            # 展平 Gram 矩阵:
+            #   [N, C_reduced, C_reduced] -> [N, 1, C_reduced*C_reduced]
+            gram_flat = gram.reshape(
+                N, 1, C_reduced * C_reduced
+            )                                                # [N, 1, 1024] 若 C_reduced=32
+
+            # 映射到目标维度 output_dim（例如设成 1024 时为恒等重采样）:
+            #   [N, 1, C_reduced^2] -> [N, 1, output_dim] -> [N, output_dim]
+            gram_embed = F.adaptive_avg_pool1d(
+                gram_flat, self.output_dim
+            ).squeeze(1)                                     # [N, output_dim]
+
+            gram_embeds.append(gram_embed)                   # 当前层: [N, output_dim]
+
+        # 按层堆叠: 列表长度 = L，每个元素 [N, output_dim]
+        # stack 后: [L, N, output_dim]，再在 dim=1 上堆: [N, L, output_dim]
+        return torch.stack(gram_embeds, dim=1)               # [N, L, output_dim]
 
 
 class Preprocessing(torch.nn.Module):

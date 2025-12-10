@@ -1,7 +1,6 @@
 # patchcore/datasets/tiny_genimage.py
 import os, random
 from enum import Enum
-from tkinter import image_types
 from typing import List, Tuple, Optional
 
 import numpy as np
@@ -53,6 +52,7 @@ class Dataset(TorchDataset):
             [
                 T.Resize(self.resize, interpolation=T.InterpolationMode.BILINEAR),
                 T.CenterCrop(self.imagesize),
+
                 # 改为随机集剪裁
                 # T.Lambda(lambda im: random_crop_single(im, self.imagesize)),
 
@@ -103,7 +103,9 @@ class Dataset(TorchDataset):
 
     def __getitem__(self, idx: int):
         t, image_path = self.imgpaths[idx]
+        # TODO: lab 
         image_types = 'HSV'   # 修改图片格式
+        # image_types = 'YCbCr'   # 修改图片格式YCbCr
         try:
             # 读图更稳健一点
             with Image.open(image_path) as im:

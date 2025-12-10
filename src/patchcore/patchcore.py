@@ -151,6 +151,9 @@ class PatchCore(torch.nn.Module):
         auto_pre_dim = max(int(d) for d in feature_dimensions) if len(feature_dimensions) else target_embed_dimension
         pre_dim = int(pretrain_embed_dimension) if (pretrain_embed_dimension and pretrain_embed_dimension > 0) else auto_pre_dim
 
+        #TODO: 选择预处理层
+        # 使用 patch 级 Gram 预处理
+        # preprocessing = patchcore.common.PatchGramPreprocessing(output_dim=pre_dim)
         # 配置预处理层：将每层展平后自适应池化到 pre_dim，再堆叠供后续聚合
         preprocessing = patchcore.common.Preprocessing(feature_dimensions, pre_dim)
         self.forward_modules["preprocessing"] = preprocessing
@@ -267,7 +270,7 @@ class PatchCore(torch.nn.Module):
 
         # 目标：把除参考层外的其它层的patch都整理成形状 [B * Gh_ref * Gw_ref, C, p, p]，
         # 使得空间位置一一对齐，只有一层则不执行
-        # len(features) == len(self.layers_to_extract_from)
+        # len(features) == len(self.layers_to_extract_from) 
         for i in range(1, len(features)):
             _features = features[i]                # [B, Gh_i * Gw_i, C_i, p, p]
             patch_dims = patch_shapes[i]          # (Gh_i, Gw_i)
@@ -310,6 +313,7 @@ class PatchCore(torch.nn.Module):
             features[i] = _features
 
         # 参考层也要展平 patch 维
+        # features[i]: [B, Gh_i * Gw_i, C_i, p, p] , i层
         features[0] = features[0].reshape(-1, *features[0].shape[-3:])
 
         # 特征预处理与聚合

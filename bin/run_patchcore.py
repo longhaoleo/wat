@@ -37,7 +37,7 @@ def choose_nn_method(
     """根据特征维度与样本量，选择最合适的 FAISS 索引实现。"""
     from patchcore import common as pc_common
 
-    SMALL_N = 2000
+    SMALL_N = 50000
     dim_ok_for_pq = (target_embed_dimension % 64 == 0)  # 本实现 PQ 的 M=64，需 d%64==0
 
     if nn == "flat":
@@ -115,12 +115,8 @@ def get_patchcore(
 def get_sampler(name: str, percentage: float, device: torch.device):
     """根据配置返回特征采样器，主要用于控制记忆库容量。"""
     name = name.lower()
-    if name == "identity":
-        return patchcore.sampler.IdentitySampler()
-    if name == "greedy_coreset":
-        return patchcore.sampler.GreedyCoresetSampler(percentage, device)
-    if name == "approx_greedy_coreset":
-        return patchcore.sampler.ApproximateGreedyCoresetSampler(percentage, device)
+    if name == "pca":
+        return patchcore.common.PCASampler(percentage)
     if name == "random":
         return patchcore.sampler.RandomSampler(percentage)
     # 中心采样：主体优先
@@ -167,12 +163,14 @@ def get_dataloaders(
     imagesize: int,
     workers: int,
 ) -> Callable[[int, Optional[str]], Dict[str, Any]]:
-    """生成一个工厂函数：按 seed/bankname 构建 train/val/test 三个 DataLoader。"""
+    """生成一个工厂函数：按 seed/bankname 构建 train/test DataLoader。
+
+    约定：
+        - train：使用 <dataset>/train/<bankname> 作为记忆库构建数据；
+        - test：优先使用 <dataset>/test/*，若不存在则退化为 <dataset>/val/* 作为测试集。
+    """
     dataset_names = list(dataset_names or [])
     dataset_roots = {ds: os.path.join(data_path, ds) for ds in dataset_names}
-
-    # 验证/测试集采用“公共”划分，同一 split 只生成一次索引，所有 bank 共用
-    val_test_indices: Dict[Tuple[str, DatasetSplit], Tuple[np.ndarray, np.ndarray]] = {}
 
     def _build_loader_for_dataset(
         dataset_root: str,
@@ -205,89 +203,61 @@ def get_dataloaders(
         )
         return ds, dl
 
-    def _get_val_test_indices(
-        dataset_root: str,
-        seed: Optional[int],
-        split: DatasetSplit,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        '''
-        为给定的 split（VAL 或 TEST 目录）计算并缓存一个“公共”的 50/50 切分索引，
-        用于在没有同时存在 val/ 与 test/ 目录时，把同一目录均分成验证/测试两部分；
-        所有 bank 共享这套索引，保证对齐与可重复。
-        '''
-        # 使用  nonlocal 关键字声明对外层变量的引用
-        nonlocal val_test_indices
-        key = (dataset_root, split)
-        if key in val_test_indices:
-            return val_test_indices[key]
-
-        reference_ds, _ = _build_loader_for_dataset(dataset_root, split, bankname=None, seed=seed)
-        # 创建一个新的 NumPy 随机数生成器
-        rng = np.random.default_rng(seed)
-        idxs = rng.permutation(len(reference_ds))
-        mid = int(len(idxs) * 0.5)
-        val_idx, test_idx = idxs[:mid], idxs[mid:]
-        val_test_indices[key] = (val_idx, test_idx)
-        return val_test_indices[key]
-
-    def _choose_val_test_loaders(
+    def _build_test_loader_for_dataset(
         seed: Optional[int],
         dataset_root: str,
-    ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    ) -> torch.utils.data.DataLoader:
+        """
+        为给定数据集构建“公共”测试集 DataLoader。
+        规则：
+            - 若存在 <root>/test/，则直接使用该目录；
+            - 否则若存在 <root>/val/，则将其视作测试集使用；
+            - 若两者都不存在，则抛出异常。
+        """
         val_dir = os.path.join(dataset_root, "val")
         test_dir = os.path.join(dataset_root, "test")
         has_val = os.path.isdir(val_dir)
         has_test = os.path.isdir(test_dir)
 
         if has_val and has_test:
-            # 情况 1：val/ 与 test/ 均存在，直接分别构建
-            # 注意：这里强制 bankname=None，表示公共评估集，不对类别（ai/nature）做过滤
-            _, val_loader = _build_loader_for_dataset(dataset_root, DatasetSplit.VAL, bankname=None, seed=seed)
-            _, test_loader = _build_loader_for_dataset(dataset_root, DatasetSplit.TEST, bankname=None, seed=seed)
+            # val/ 与 test/ 均存在，优先选择 test/ 作为测试集。
+            _, test_loader = _build_loader_for_dataset(
+                dataset_root, DatasetSplit.TEST, bankname=None, seed=seed
+            )
             LOGGER.info(
-                "Use distinct val/ (%d) and test/ (%d) splits under %s.",
-                len(val_loader.dataset),
+                "Use existing test/ (%d) under %s.",
                 len(test_loader.dataset),
                 dataset_root,
             )
-            return val_loader, test_loader
+            return test_loader
 
-        # 情况 2：只有一个目录（val/ 或 test/）可用，需内部 50/50 切分
-        single_split = DatasetSplit.VAL if has_val else DatasetSplit.TEST
-        source_dir = val_dir if has_val else test_dir
+        if has_test:
+            # 仅存在 test/ 目录
+            _, test_loader = _build_loader_for_dataset(
+                dataset_root, DatasetSplit.TEST, bankname=None, seed=seed
+            )
+            LOGGER.info(
+                "Use test/ (%d) as evaluation split under %s.",
+                len(test_loader.dataset),
+                dataset_root,
+            )
+            return test_loader
 
-        # 生成该目录的“公共”均分索引（val/test 各一半），所有 bank 共用
-        val_idx, test_idx = _get_val_test_indices(dataset_root, seed, split=single_split)
+        if has_val:
+            # 仅存在 val/ 目录，将其视作测试集
+            _, test_loader = _build_loader_for_dataset(
+                dataset_root, DatasetSplit.VAL, bankname=None, seed=seed
+            )
+            LOGGER.info(
+                "Use val/ (%d) as evaluation split under %s (no test/ found).",
+                len(test_loader.dataset),
+                dataset_root,
+            )
+            return test_loader
 
-        # 读取该目录全部样本（bankname=None 表示不做 bank 过滤）
-        full_ds, _ = _build_loader_for_dataset(dataset_root, single_split, bankname=None, seed=seed)
-
-        # 用索引构造子集
-        val_subset = torch.utils.data.Subset(full_ds, val_idx)
-        test_subset = torch.utils.data.Subset(full_ds, test_idx)
-
-        # 构建 DataLoader（这里未显式 shuffle；是否打乱由更高一层策略决定）
-        val_loader = torch.utils.data.DataLoader(
-            val_subset,
-            batch_size=batch_size,
-            num_workers=workers,
-            pin_memory=True,
+        raise RuntimeError(
+            f"Neither 'val/' nor 'test/' exists under dataset root: {dataset_root}"
         )
-        test_loader = torch.utils.data.DataLoader(
-            test_subset,
-            batch_size=batch_size,
-            num_workers=workers,
-            pin_memory=True,
-        )
-
-        LOGGER.info(
-            "Only %s/ found under %s, split 50/50 -> VAL=%d | TEST=%d.",
-            single_split.value,
-            source_dir,
-            len(val_subset),
-            len(test_subset),
-        )
-        return val_loader, test_loader
 
 
     def return_dataloaders(seed: int, bankname: Optional[str]) -> Dict[str, Any]:
@@ -313,25 +283,21 @@ def get_dataloaders(
             drop_last=False,
         )
 
-        # 2) 验证/测试：为每个数据集单独构建 val/test Loader
-        val_loaders: Dict[str, torch.utils.data.DataLoader] = {}
+        # 2) 测试：为每个数据集单独构建“公共” test Loader
         test_loaders: Dict[str, torch.utils.data.DataLoader] = {}
         for ds_name, ds_root in dataset_roots.items():
-            val_loader, test_loader = _choose_val_test_loaders(seed=seed, dataset_root=ds_root)
-            val_loader.name = f"{ds_name}-val"
+            test_loader = _build_test_loader_for_dataset(seed=seed, dataset_root=ds_root)
             test_loader.name = f"{ds_name}-test"
-            val_loaders[ds_name] = val_loader
             test_loaders[ds_name] = test_loader
 
         train_loader.name = f"{'+'.join(dataset_names)}-train[{bankname}]"
 
         LOGGER.info(
-            "Dataloaders ready: train=%d | val datasets=%s | test datasets=%s",
+            "Dataloaders ready: train=%d | test datasets=%s",
             len(train_ds),
-            {k: len(v.dataset) for k, v in val_loaders.items()},
             {k: len(v.dataset) for k, v in test_loaders.items()},
         )
-        return {"train": train_loader, "val": val_loaders, "test": test_loaders}
+        return {"train": train_loader, "test": test_loaders}
 
     return return_dataloaders
 
@@ -359,106 +325,221 @@ def get_image_scores(patchcore_model, dataloader) -> np.ndarray:
 # 主流程
 # -----------------------------
 def main(args):
-    """主流程：加载数据 -> 训练记忆库 -> 公共评估 -> 可视化。"""
+    """
+    主流程：
+        - phase == 'train'：
+            1) 在指定 train 数据集上，为每个 bank 训练 PatchCore 记忆库并保存到磁盘；
+            2) 在“公共 train”（不区分 bank）的一个子集上训练逻辑回归分类器，并保存到磁盘。
+        - phase == 'infer'：
+            1) 从磁盘加载已训练好的 PatchCore 记忆库和逻辑回归分类器；
+            2) 在指定 test 数据集上执行推理/评估（不再依赖 val）。
+    """
     np.seterr(all='raise')
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     LOGGER.info("Using device: %s", device)
 
-    # 数据路径与数据集列表
-    dataset_names = args.dataset_names 
+    # 数据路径
     data_path = os.path.expanduser(args.data_path)
 
-    # Data
-    build_dataloader = get_dataloaders(
+    # 训练 / 测试数据集名称
+    train_dataset_names = list(args.dataset_names or [])
+    if not train_dataset_names:
+        raise RuntimeError("至少需要提供一个用于训练的 dataset 名称，通过 --dataset_names 指定。")
+    test_dataset_names = list(args.test_dataset_names) if args.test_dataset_names else train_dataset_names
+    LOGGER.info(
+        "Train datasets: %s | Test datasets: %s",
+        train_dataset_names,
+        test_dataset_names,
+    )
+
+    # 读取 banknames
+    banknames = args.banknames
+    bank_ai, bank_nature = banknames[0], banknames[1]
+
+    # Sampler
+    sampler = get_sampler(args.sampler_name, args.coreset_percentage, device)
+
+    # -----------------------------
+    # Phase 1: 训练 PatchCore 记忆库 + 逻辑回归分类器，并保存到磁盘
+    # -----------------------------
+    if args.phase in ("train", "both"):
+        # 1) 构建 PatchCore builder，用于后续为各 bank 训练记忆库
+        build_pc = get_patchcore(
+            backbone_name=args.backbone_name,
+            layers_to_extract_from=args.layers_to_extract_from,
+            pretrain_embed_dimension=args.pretrain_embed_dimension,
+            target_embed_dimension=args.target_embed_dimension,
+            patchsize=args.patchsize,
+            anomaly_scorer_k=args.anomaly_scorer_k,
+        )
+
+        # 2) 基于“训练数据集列表”构建 DataLoader 工厂
+        build_dataloader_train = get_dataloaders(
+            data_path=data_path,
+            dataset_names=train_dataset_names,
+            batch_size=args.batch_size,
+            resize=args.resize,
+            imagesize=args.imagesize,
+            workers=args.workers,
+        )
+
+        # 3) 为每个 bank 训练一个 PatchCore 记忆库，并保存到磁盘
+        pcs: Dict[str, patchcore.patchcore.PatchCore] = {}
+        for bank in banknames:
+            loaders_for_bank = build_dataloader_train(seed=args.seed, bankname=bank)
+            estN = len(loaders_for_bank["train"].dataset)
+            nn_method = choose_nn_method(
+                nn=args.nn_method,
+                target_embed_dimension=args.target_embed_dimension,
+                est_num_features=max(estN, 1),
+                faiss_on_gpu=args.faiss_on_gpu,
+                faiss_num_workers=args.faiss_num_workers,
+            )
+            pc = train_memorybank(build_pc, sampler, device, nn_method, loaders_for_bank["train"])
+
+            # 记忆库保存路径：<pc_save_root>/<bank>/
+            if args.pc_save_root:
+                save_dir = os.path.join(args.pc_save_root, bank)
+                os.makedirs(save_dir, exist_ok=True)
+                pc.save_to_path(save_dir)
+                LOGGER.info("Saved PatchCore memory bank for '%s' to %s", bank, save_dir)
+
+            pcs[bank] = pc
+
+        # 4) 公共 Loader（不筛 bank），从“训练数据集列表”构建：
+        #    - 用于给逻辑回归分类器提供训练数据（只采样一部分 train）。
+        common_loaders = build_dataloader_train(seed=args.seed, bankname=None)
+
+        # 1) 取“公共 train”作为分类器可用的样本池（包含 ai/nature 两类）
+        base_train_loader = common_loaders["train"]
+        base_train_dataset = base_train_loader.dataset
+        total_train = len(base_train_dataset)
+        if total_train == 0:
+            raise RuntimeError("No training samples found for classifier training.")
+
+        # 2) 按给定比例随机采样一部分样本用来训练逻辑回归（避免全量 train 过拟合 / 过慢）
+        frac = float(args.cls_train_fraction)
+        if not (0.0 < frac <= 1.0):
+            raise ValueError(f"cls_train_fraction must be in (0,1], got {frac}.")
+        n_sample = max(1, int(total_train * frac))
+
+        rng = np.random.default_rng(args.seed)
+        sampled_indices = rng.choice(total_train, size=n_sample, replace=False)
+        sampled_dataset = torch.utils.data.Subset(base_train_dataset, sampled_indices)
+        sampled_loader = torch.utils.data.DataLoader(
+            sampled_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,          # 保持顺序一致，便于双 bank 对齐
+            num_workers=args.workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+        LOGGER.info(
+            "Training logistic classifier on %d / %d train samples (fraction=%.3f).",
+            n_sample,
+            total_train,
+            frac,
+        )
+
+        # 3) 从原始数据集中直接读取标签（is_ai），避免重复依赖 PatchCore.predict 的返回结构
+        y_train_list: List[int] = []
+        for idx in sampled_indices:
+            sample = base_train_dataset[idx]
+            if isinstance(sample, dict):
+                label = sample.get("is_ai")
+            else:
+                # 兼容形如 (image, label, ...) 的返回格式
+                label = sample[1] if len(sample) > 1 else 0
+            if isinstance(label, torch.Tensor):
+                label = int(label.item())
+            else:
+                label = int(label)
+            y_train_list.append(label)
+        y_train = np.asarray(y_train_list, dtype=int).reshape(-1)
+
+        # 4) 用两套 PatchCore 记忆库分别对这部分样本打分，得到 (score_ai, score_nature)
+        #    这里使用辅助函数 get_image_scores，仅取图像级分数，避免在此处重复解析 predict 的完整返回。
+        train_scores_a = get_image_scores(pcs[bank_ai], sampled_loader)
+        train_scores_b = get_image_scores(pcs[bank_nature], sampled_loader)
+
+        features_train = build_feature_matrix(
+            np.asarray(train_scores_a, dtype=float),
+            np.asarray(train_scores_b, dtype=float),
+        )
+
+        # 5) 构建 Evaluator，训练逻辑回归分类器并保存到指定路径
+        if args.classifier_path:
+            os.makedirs(os.path.dirname(args.classifier_path), exist_ok=True)
+        evaluator = Evaluator(save_classifier_path=args.classifier_path)
+        evaluator.fit(features_train, y_train)
+
+        # 若仅训练，则此处结束；若 phase == "both"，则继续进入推理阶段。
+        if args.phase == "train":
+            return
+
+    # -----------------------------
+    # Phase 2: 仅推理/评估
+    #   - 假设 PatchCore 记忆库与逻辑回归分类器已在 Phase 1 中训练好并保存；
+    #   - 这里只负责：加载 PatchCore + 分类器，在指定 test 数据集上做推理/评估；
+    #   - 不再依赖 val。
+    # -----------------------------
+    if args.phase not in ("infer", "both"):
+        raise ValueError(f"Unknown phase: {args.phase}. Expected 'train', 'infer' or 'both'.")
+
+    # 1) 从磁盘加载 PatchCore 记忆库（每个 bank 一份）
+    if not args.pc_save_root:
+        raise RuntimeError("Phase 'infer' requires a valid --pc_save_root to load PatchCore memory banks.")
+
+    pcs: Dict[str, patchcore.patchcore.PatchCore] = {}
+    for bank in banknames:
+        load_dir = os.path.join(args.pc_save_root, bank)
+        nn_method = patchcore.common.FaissNN(on_gpu=args.faiss_on_gpu, num_workers=args.faiss_num_workers)
+        pc = patchcore.patchcore.PatchCore(device)
+        pc.load_from_path(load_path=load_dir, device=device, nn_method=nn_method)
+        pcs[bank] = pc
+        LOGGER.info("Loaded PatchCore memory bank for '%s' from %s", bank, load_dir)
+
+    # 2) 基于“测试数据集列表”构建 DataLoader 工厂，并拿到公共 test Loader
+    build_dataloader_test = get_dataloaders(
         data_path=data_path,
-        dataset_names=dataset_names,
+        dataset_names=test_dataset_names,
         batch_size=args.batch_size,
         resize=args.resize,
         imagesize=args.imagesize,
         workers=args.workers,
     )
+    common_loaders = build_dataloader_test(seed=args.seed, bankname=None)
 
-    # 读取 banknames（要求 2 个，用于双库评估）
-    banknames = args.banknames
-    if len(banknames) != 2:
-        raise ValueError(f"需要提供恰好 2 个 bank 名称，例如 --banknames ai nature，收到: {banknames}")
+    # 3) 加载已经训练好的逻辑回归分类器
+    if not args.classifier_path:
+        raise RuntimeError("Phase 'infer' requires a valid --classifier_path to load the trained classifier.")
 
-
-    # Sampler
-    sampler = get_sampler(args.sampler_name, args.coreset_percentage, device)
-
-    # PatchCore builder
-    build_pc = get_patchcore(
-        backbone_name=args.backbone_name,
-        layers_to_extract_from=args.layers_to_extract_from,
-        pretrain_embed_dimension=args.pretrain_embed_dimension,
-        target_embed_dimension=args.target_embed_dimension,
-        patchsize=args.patchsize,
-        anomaly_scorer_k=args.anomaly_scorer_k,
-    )
-
-
-    # 选择 NN 方法（用可能更大的训练集规模估计）
-    pcs: Dict[str, patchcore.patchcore.PatchCore] = {}
-    bank_loaders: Dict[str, Dict[str, torch.utils.data.DataLoader]] = {}
-    
-    # 逐个 bank 构建“只含本域样本”的训练 Loader，并训练对应记忆库
-    for bank in banknames:
-        loaders_for_bank = build_dataloader(seed=args.seed, bankname=bank)
-        bank_loaders[bank] = loaders_for_bank
-
-        estN = len(loaders_for_bank["train"].dataset)
-        nn_method = choose_nn_method(
-            nn=args.nn_method,
-            target_embed_dimension=args.target_embed_dimension,
-            est_num_features=max(estN, 1),
-            faiss_on_gpu=args.faiss_on_gpu,
-            faiss_num_workers=args.faiss_num_workers,
-        )
-        pc = train_memorybank(build_pc, sampler, device, nn_method, loaders_for_bank["train"])
-        pcs[bank] = pc
-
-    # 公共 Loader（不筛 bank）用于验证/测试阶段，保证两套记忆库看到同一批样本
-    common_loaders = build_dataloader(seed=args.seed, bankname=None)
-
-    bank_ai, bank_nature = banknames[0], banknames[1]
+    evaluator = Evaluator(save_classifier_path=args.classifier_path)
+    evaluator.load_classifier(args.classifier_path)
+    LOGGER.info("Loaded logistic classifier from: %s", args.classifier_path)
 
     summary_logs: Dict[str, float] = {}
     visualization_cache: Dict[str, Dict[str, Any]] = {}
     csv_rows: List[List[Any]] = []
 
-    for ds_name in dataset_names:
-        val_loader = common_loaders["val"].get(ds_name)
+    for ds_name in test_dataset_names:
         test_loader = common_loaders["test"].get(ds_name)
-        if val_loader is None or test_loader is None:
-            LOGGER.warning("Dataset %s missing val/test loaders, skip evaluation.", ds_name)
+        if test_loader is None:
+            LOGGER.warning("Dataset %s missing test loader, skip evaluation.", ds_name)
             continue
 
-        # val/test 推理
-        val_scores_a, val_masks_a, y_val,  _ = pcs[bank_ai].predict(val_loader)
-
-        val_scores_b, val_masks_b, y_val,  _ = pcs[bank_nature].predict(val_loader)
-
+        # 仅对 test 做推理/评估：双 bank 分别打分，然后送入已经训练好的逻辑回归分类器
         test_scores_a, test_masks_a, y_test,  test_path_a = pcs[bank_ai].predict(test_loader)
         test_scores_b, test_masks_b, y_test,  test_path_b = pcs[bank_nature].predict(test_loader)
 
-        evaluator = Evaluator(save_classifier_path=None)
-
-        features_val = build_feature_matrix(val_scores_a, val_scores_b)
         features_test = build_feature_matrix(test_scores_a, test_scores_b)
 
-        evaluator.fit(features_val, y_val)
-        prob_val = evaluator.predict(features_val)
-        evaluator.select_threshold(prob_val, y_val)
         prob_test = evaluator.predict(features_test)
-        val_auc_b, _, _ = evaluator.evaluate(prob_val, y_val)
         test_auc_b, y_pred, rep_b = evaluator.evaluate(prob_test, y_test)
 
         LOGGER.info(
-            "[%s] τ=%.6f | VAL AUC=%.4f | TEST AUC=%.4f",
+            "[%s] TEST AUC=%.4f",
             ds_name,
-            evaluator.threshold,
-            val_auc_b,
             test_auc_b,
         )
 
@@ -477,7 +558,6 @@ def main(args):
         if rep_b:
             LOGGER.info("[%s] TEST report:\n%s", ds_name, rep_b)
         summary_logs.update({
-            f"{ds_name}_logreg_val_auc": float(val_auc_b),
             f"{ds_name}_logreg_test_auc": float(test_auc_b),
         })
 
@@ -528,25 +608,42 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
+    HOME = os.path.expanduser("~/dreamycore")
     # 数据
     parser.add_argument("--data_path", type=str, default=os.path.expanduser("~/datasets/tiny_genimage"))
     parser.add_argument("--dataset_names", nargs="+", default=[
-        # 'adm',
-        # 'biggan', 
-        # 'glide', 
-        # 'midjourney', 
+        'adm',
+        'biggan', 
+        'glide', 
+        'midjourney', 
         'sdv5', 
-        # 'vqdm', 
-        # 'wukong',
+        'vqdm', 
+        'wukong',
         # 'Chameleon',
         # 'sdv5_bigval'
-    ],help="数据集列表")
+    ], help="用于训练 PatchCore 记忆库和逻辑回归分类器的数据集名称列表（train split）。")
+    parser.add_argument(
+        "--test_dataset_names",
+        nargs="+",
+        # default=None,
+        default=[
+        'adm',
+        'biggan', 
+        'glide', 
+        'midjourney', 
+        'sdv5', 
+        'vqdm', 
+        'wukong',
+        'Chameleon',
+        'sdv5_bigval',
+        ],
+        help="用于推理/评估的数据集名称列表（test/val split）；若不指定，则默认与 --dataset_names 相同。",
+    )
     parser.add_argument("--seed", type=int, default=0)
 
     # dataloader
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--workers", type=int, default=12)
+    parser.add_argument("--workers", type=int, default=14)
     parser.add_argument("--resize", type=int, default=256)
     parser.add_argument("--imagesize", type=int, default=224)
 
@@ -554,10 +651,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backbone_name",
         default="clip_vit_b16",
-        help=(
-            "骨干网络名称，例如 resnet50 / vit_base / vit_swin_base / clip_vit_b16"
-        ),
-    )
+        help=("骨干网络名称，例如 resnet50 / vit_base / vit_swin_base / clip_vit_b16"))
     parser.add_argument(
         "--layers_to_extract_from", nargs="+",
         # default=["layer2"]     # resnet50 的 layer2 
@@ -583,18 +677,44 @@ if __name__ == "__main__":
     parser.add_argument("--patchsize", type=int, default=3)
     parser.add_argument("--anomaly_scorer_k", type=int, default=3)
 
+    # 逻辑回归分类器 / 阶段控制相关：
+    #   - phase = train ：在公共 train 上（按比例采样）训练 PatchCore 记忆库 + 逻辑回归，并保存到磁盘；
+    #   - phase = infer ：从磁盘加载已训练好的 PatchCore 记忆库与逻辑回归，只在 test 上做推理/评估；
+    #   - phase = both  ：先执行 train 流程，再在同一次运行中立即执行 infer 流程（默认行为）。
+    parser.add_argument(
+        "--phase",type=str,choices=["train", "infer", "both"],
+        default="infer",
+        help=("运行阶段：'train' 仅训练 PatchCore 记忆库和逻辑回归；"
+            "'infer' 仅加载已训练模型并在 test 上推理/评估；"
+            "'both' 先训练再在同一次运行中执行推理/评估（默认）。"))
+    parser.add_argument(
+        "--classifier_path",type=str,
+        default=os.path.join( HOME, "classifier", "logreg_classifier.joblib"),
+        help="保存 / 加载逻辑回归分类器的路径。",
+    )
+    parser.add_argument(
+        "--pc_save_root",type=str,
+        default=os.path.join( HOME, "memorybanks"),
+        help="保存 / 加载 PatchCore 记忆库的根目录，每个 bank 将保存在该目录下以 bank 名称命名的子目录中。",
+    )
+    parser.add_argument(
+        "--cls_train_fraction",type=float,default=0.1,
+        help="用于训练逻辑回归分类器的训练集采样比例 (0,1]，例如 0.1 表示随机采样 10% 的 train 样本。",
+    )
+
     # sampler / coreset
     parser.add_argument("--sampler_name", 
+                        # default="central",
                         # default="central_mahal",
                         # default="density",
                         default="random",
-                        # default="approx_greedy_coreset"
+                        # default="pca"
                         )
-    parser.add_argument("--coreset_percentage", type=float, default=0.1)
+    parser.add_argument("--coreset_percentage", type=float, default=0.001)
     # FAISS / 设备
     parser.add_argument("--faiss_on_gpu", action="store_true")
     parser.add_argument("--faiss_num_workers", type=int, default=12)
-    parser.add_argument("--nn_method", choices=["auto", "flat", "ivfpq"], default="flat")
+    parser.add_argument("--nn_method", choices=["auto", "flat", "ivfpq"], default="auto")
 
     # 两个 bank 名称
     parser.add_argument("--banknames", nargs="+", default=['ai','nature'],)

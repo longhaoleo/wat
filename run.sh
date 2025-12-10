@@ -17,7 +17,7 @@ echo -e "=====================================\n" >> "$LOG_FILE"
 
 # 定义需要运行的数据集名称列表
 DATASETS=(
-    # "adm"
+    "adm"
     "biggan"
     "glide"
     "midjourney"
