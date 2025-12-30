@@ -27,6 +27,9 @@ def plot_random_segmentations(
     resize: int = None,
     imagesize: int = None,
     annotations: list | None = None,
+    diff_mode: str = "sym",
+    diff_eps: float = 1e-6,
+    smooth_bilinear: bool = True,
 ):
     """
     随机选择若干张图像，显示它们的异常分割结果，并保存分割图像到指定文件夹。
@@ -45,11 +48,39 @@ def plot_random_segmentations(
 
 
     # 随机选择 num_samples 张图像进行显示
-    sample_indices = random.sample(range(len(image_paths)), num_samples)
+    n_total = len(image_paths)
+    if n_total == 0:
+        LOGGER.warning("No images to visualize (empty image_paths).")
+        return
+    num_samples = min(int(num_samples), n_total)
+    sample_indices = random.sample(range(n_total), num_samples)
     sample_image_paths = [image_paths[i] for i in sample_indices]
     sample_segmentations_a = [segmentations_a[i] for i in sample_indices]
-    sample_segmentations_b = [segmentations_a[i] for i in sample_indices]
+    sample_segmentations_b = [segmentations_b[i] for i in sample_indices]
     sample_annotations = [annotations[i] for i in sample_indices] if annotations else [None] * len(sample_indices)
+
+    def _mask_diff(a, b) -> np.ndarray:
+        aa = np.asarray(a, dtype=float)
+        bb = np.asarray(b, dtype=float)
+        if diff_mode == "raw":
+            return aa - bb
+        if diff_mode == "rel_to_b":
+            return (aa - bb) / (np.abs(bb) + float(diff_eps))
+        if diff_mode == "sym":
+            return (aa - bb) / (np.abs(aa) + np.abs(bb) + float(diff_eps))
+        raise ValueError(f"Unknown diff_mode={diff_mode!r}, expected raw|rel_to_b|sym.")
+
+    def _smooth_to_image(segmentation: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray:
+        if not smooth_bilinear:
+            return np.asarray(segmentation, dtype=float)
+        try:
+            import patchcore.common as pc_common
+
+            seg = np.asarray(segmentation, dtype=float)
+            segmentor = pc_common.RescaleSegmentor(device=torch.device("cpu"), target_size=target_hw)
+            return np.asarray(segmentor.convert_to_segmentation(seg[None, ...])[0], dtype=float)
+        except Exception:
+            return np.asarray(segmentation, dtype=float)
 
     # 创建保存文件夹
     os.makedirs(savefolder, exist_ok=True)
@@ -77,13 +108,22 @@ def plot_random_segmentations(
             image = preprocess(image)
         image = np.array(image)
 
+        target_hw = (int(image.shape[0]), int(image.shape[1]))
+        segmentation_a = _smooth_to_image(segmentation_a, target_hw=target_hw)
+        segmentation_b = _smooth_to_image(segmentation_b, target_hw=target_hw)
+
         # 保存路径处理
         savename = image_path.split("/")
         savename = "_".join(savename[-save_depth:])
         savename = os.path.join(savefolder, savename)
         
-        # 绘制图像、掩码和分割结果
-        f, axes = plt.subplots(1, 3) 
+        # 绘制图像和差分热力图（代替原来的 a/b 两张图）
+        diff = _mask_diff(segmentation_a, segmentation_b)
+        v = float(np.nanpercentile(np.abs(diff), 98))
+        if not np.isfinite(v) or v <= 0:
+            v = 1.0
+
+        f, axes = plt.subplots(1, 2)
         axes[0].imshow(image)
         axes[0].set_title("Image")
         axes[0].axis('off')
@@ -98,15 +138,11 @@ def plot_random_segmentations(
                 )
             except Exception:
                 pass
-        axes[1].imshow(segmentation_a)
-        axes[1].set_title("Segmentation_ai")
+        axes[1].imshow(diff, cmap="coolwarm", vmin=-v, vmax=v)
+        axes[1].set_title(f"Diff(ai-nature) [{diff_mode}]")
         axes[1].axis('off')
-
-        axes[2].imshow(segmentation_b)
-        axes[2].set_title("Segmentation_nature")
-        axes[2].axis('off')
         # 调整布局并保存
-        f.set_size_inches(12, 4)
+        f.set_size_inches(10, 4)
         f.tight_layout()
         f.savefig(savename)
         plt.close()

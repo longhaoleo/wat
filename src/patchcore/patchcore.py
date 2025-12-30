@@ -74,6 +74,52 @@ def to_nchw_if_vit(x: torch.Tensor, allow_dist_token: bool = True) -> torch.Tens
     )
 
 
+def to_segmentation_scores(
+    scores,
+    *,
+    gamma: float = 0.7,
+    eps: float = 1e-6,
+    normalize: bool = True,
+):
+    """
+    segmentation score = score - mean(score)
+
+    > 0 : 高于整体均值（更异常）
+    < 0 : 低于整体均值（更正常）
+
+    返回映射到 [0, 1] 的值，适合可视化
+    """
+    was_numpy = isinstance(scores, np.ndarray)
+    if was_numpy:
+        scores = torch.from_numpy(scores)
+
+    x = scores.float()
+
+    # 1. 和均值的差
+    diff = x - x.mean()
+
+    # 2. 标准化（可选，但强烈推荐）
+    if normalize:
+        diff = diff / (x.std() + eps)
+
+    # 3. 对称压缩，避免极端值
+    diff = torch.tanh(diff)
+
+    # 4. 映射到 [0, 1]
+    diff = (diff + 1.0) / 2.0
+
+    # 5. gamma 控制对比度
+    if gamma != 1.0:
+        diff = diff ** gamma
+
+    if was_numpy:
+        diff = diff.numpy()
+
+    return diff
+
+
+
+
 class PatchCore(torch.nn.Module):
     """
     PatchCore异常检测类，基于图像补丁级别的特征进行异常检测。
@@ -480,21 +526,24 @@ class PatchCore(torch.nn.Module):
             image_scores = self.patch_maker.unpatch_scores(
                 patch_scores, batchsize=batchsize
             )
-
+            # print("image_scores before aggregation:")
+            # print(image_scores)
             # 1.聚合patch得分为图像分数
             # self.patch_maker.score() 默认可选平均、最大或其他策略
-            image_scores = self.patch_maker.score(image_scores,reduction='mean')
+            image_scores = self.patch_maker.score(image_scores,mode='softmax')
 
             # 2.生成patch得分热力图    
             # scales 即 patch 网格的行列数 (Gh, Gw)
             scales = patch_shapes[0]
+
+            # patch_scores = to_segmentation_scores(patch_scores)
 
             # 恢复为 [B, Gh_ref, Gw_ref]
             patch_scores = patch_scores.reshape(batchsize, scales[0], scales[1])
             # anomaly_segmentor 将 patch-level mask 上采样回原图尺寸
             segmentation = self.anomaly_segmentor.convert_to_segmentation(patch_scores)
 
-        return [score for score in image_scores], segmentation
+        return [score for score in image_scores], patch_scores
 
 
     @staticmethod
@@ -622,7 +671,8 @@ class PatchMaker:
                 其中 number_of_total_patches: [Gh, Gw]，每个空间维度上的 patch 数
         """
         # 计算 patchsize 的一半作为 padding，保证边缘可切到完整 patch
-        padding = int((self.patchsize - 1) / 2)
+        # padding = int((self.patchsize - 1) / 2)
+        padding = 0
 
         # 若传入是二维向量 (N, D)，补成 4D，以便 Unfold 工作:
         # (N, D) -> (N, 1, 1, D)（把 D 当成“宽度”维，用 1×D 的滑窗切）
@@ -673,26 +723,29 @@ class PatchMaker:
         """
         return x.reshape(batchsize, -1, *x.shape[1:])
 
-    def score(self, x, reduction: str = "mean"):
-        """
-        对输入张量/数组在其所有剩余维度上聚合，得到“每个样本的单一分数”。
-        参数:
-            reduction: "max"取全局最大值；"mean" 取全局均值。
-        """
-        was_numpy = False
+    def score(self, x, mode="softmax", **kwargs):
         if isinstance(x, np.ndarray):
-            was_numpy = True
             x = torch.from_numpy(x)
 
-        if reduction not in ("max", "mean"):
-            raise ValueError(f"Unsupported reduction: {reduction}")
+        if x.ndim == 1:
+            return x
 
-        if x.ndim <= 1:
-            out = x
+        if mode == "mean":
+            return x.mean(dim=tuple(range(1, x.ndim)))
+        elif mode == "max":
+            return x.amax(dim=tuple(range(1, x.ndim)))
+        elif mode == "softmax":
+            return softmax_pool(x, kwargs.get("temperature", 1.0))
+        elif mode == "quantile":
+            return quantile_score(x, kwargs.get("q", 0.9))
         else:
-            dims = tuple(range(1, x.ndim))
-            out = torch.amax(x, dim=dims) if reduction == "max" else torch.mean(x, dim=dims)
+            raise ValueError
+        
+def softmax_pool(x, temperature=1.0):
+    dims = tuple(range(1, x.ndim))
+    w = torch.softmax(x / temperature, dim=dims[-1])
+    return (w * x).sum(dim=dims)
 
-        if was_numpy:
-            return out.numpy()
-        return out
+def quantile_score(x, q=0.5):
+    dims = tuple(range(1, x.ndim))
+    return torch.quantile(x, q, dim=dims)

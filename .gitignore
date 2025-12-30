@@ -1,8 +1,11 @@
 __pycache__/
 
-requirements.txt
+
 visualization
 adaption
+
+memorybanks
+classifier
 
 # 文件夹
 runs/*
@@ -11,3 +14,4 @@ Report/*
 memorybanks/*
 classifier/*
 output_images/*
+output_images*

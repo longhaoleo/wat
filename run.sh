@@ -1,7 +1,7 @@
 # Bash语法：
-# 临时加入环境变量
+# 临时加入环境变量 
 export PYTHONPATH=$(pwd)/src:$PYTHONPATH
-mamba activate .core
+mamba activate core
 python -m bin.run_patchcore
 
 

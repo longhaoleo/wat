@@ -1,0 +1,22 @@
+name: core
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch>=2.1
+  - pytorch-cuda=12.4
+  - torchvision>=0.16
+  - faiss-gpu
+  - numpy<2
+  - matplotlib>=3.5.0
+  - pillow>=8.4.0
+  - pretrainedmodels>=0.7.4
+  - scikit-learn>=1.0.1
+  - scikit-image>=0.18.3
+  - scipy>=1.7.1
+  - tqdm>=4.62.3
+  - timm
+  - umap-learn
+  - pip
+  - pip:
+      - open_clip_torch

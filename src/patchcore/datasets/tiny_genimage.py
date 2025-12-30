@@ -104,7 +104,8 @@ class Dataset(TorchDataset):
     def __getitem__(self, idx: int):
         t, image_path = self.imgpaths[idx]
         # TODO: lab 
-        image_types = 'HSV'   # 修改图片格式
+        image_types = 'RGB'   # 修改图片格式RGB
+        # image_types = 'HSV'   # 修改图片格式
         # image_types = 'YCbCr'   # 修改图片格式YCbCr
         try:
             # 读图更稳健一点

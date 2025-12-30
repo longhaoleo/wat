@@ -399,7 +399,7 @@ class PatchGramPreprocessing(torch.nn.Module):
             #   转置后:           [N, P, C]   （最后一维是通道）
             #   adaptive_avg_pool1d(..., C_reduced) 在通道维上平均到 32 维
             #   再转回:           [N, C_reduced, P]
-            C_reduced = min(C, 32)
+            C_reduced = min(C, 64)
             feat_flat_T = feat_flat.transpose(1, 2)          # [N, P, C]
             feat_flat_T = F.adaptive_avg_pool1d(
                 feat_flat_T, C_reduced

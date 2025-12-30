@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from sklearn.metrics import classification_report, roc_auc_score
 import csv
+from dataclasses import dataclass
 
 import patchcore.backbones
 import patchcore.common
@@ -321,6 +322,97 @@ def get_image_scores(patchcore_model, dataloader) -> np.ndarray:
 
     return image_scores
 
+
+@dataclass(frozen=True)
+class RelativeDiffResult:
+    rel_to_b: np.ndarray
+    sym: np.ndarray
+
+
+def compute_relative_diffs(
+    scores_a: np.ndarray,
+    scores_b: np.ndarray,
+    *,
+    eps: float = 1e-8,
+) -> RelativeDiffResult:
+    """
+    给两套 bank 的图像级分数计算“相对差分”：
+    - rel_to_b: (a-b)/(abs(b)+eps)   （以 b 为参照的相对变化）
+    - sym:      (a-b)/(abs(a)+abs(b)+eps) （对称归一化，数值更稳定）
+    """
+    a = np.asarray(scores_a, dtype=float).reshape(-1)
+    b = np.asarray(scores_b, dtype=float).reshape(-1)
+    rel_to_b = (a - b) / (np.abs(b) + eps)
+    sym = (a - b) / (np.abs(a) + np.abs(b) + eps)
+    return RelativeDiffResult(rel_to_b=rel_to_b, sym=sym)
+
+
+def save_diff_visualizations(
+    *,
+    out_dir: str,
+    dataset_name: str,
+    scores_a: np.ndarray,
+    scores_b: np.ndarray,
+    y_true: np.ndarray,
+    diffs: RelativeDiffResult,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    os.makedirs(out_dir, exist_ok=True)
+    prefix = os.path.join(out_dir, dataset_name)
+
+    a = np.asarray(scores_a, dtype=float).reshape(-1)
+    b = np.asarray(scores_b, dtype=float).reshape(-1)
+    y = np.asarray(y_true).reshape(-1)
+
+    # 1) scatter: score_ai vs score_nature
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for cls, color, name in [(0, "tab:blue", "nature"), (1, "tab:orange", "ai")]:
+        mask = (y == cls)
+        if mask.any():
+            ax.scatter(b[mask], a[mask], s=12, alpha=0.6, c=color, label=f"label={name}")
+    mn = float(np.nanmin(np.concatenate([a, b])))
+    mx = float(np.nanmax(np.concatenate([a, b])))
+    ax.plot([mn, mx], [mn, mx], "--", linewidth=1, color="gray", label="a=b")
+    ax.set_xlabel("score_nature (bank B)")
+    ax.set_ylabel("score_ai (bank A)")
+    ax.set_title(f"{dataset_name}: score scatter")
+    ax.legend(loc="best", frameon=True)
+    fig.tight_layout()
+    fig.savefig(prefix + "_scatter.png", dpi=200)
+    plt.close(fig)
+
+    # 2) histogram: rel diff by class
+    fig, ax = plt.subplots(figsize=(7, 4))
+    rel = diffs.rel_to_b.reshape(-1)
+    bins = 60
+    for cls, color, name in [(0, "tab:blue", "nature"), (1, "tab:orange", "ai")]:
+        mask = (y == cls)
+        if mask.any():
+            ax.hist(rel[mask], bins=bins, alpha=0.55, color=color, label=f"label={name}", density=True)
+    ax.set_xlabel("(a-b)/(abs(b)+eps)")
+    ax.set_ylabel("density")
+    ax.set_title(f"{dataset_name}: relative diff")
+    ax.legend(loc="best", frameon=True)
+    fig.tight_layout()
+    fig.savefig(prefix + "_rel_diff_hist.png", dpi=200)
+    plt.close(fig)
+
+    # 3) histogram: symmetric diff by class
+    fig, ax = plt.subplots(figsize=(7, 4))
+    sym = diffs.sym.reshape(-1)
+    for cls, color, name in [(0, "tab:blue", "nature"), (1, "tab:orange", "ai")]:
+        mask = (y == cls)
+        if mask.any():
+            ax.hist(sym[mask], bins=bins, alpha=0.55, color=color, label=f"label={name}", density=True)
+    ax.set_xlabel("(a-b)/(abs(a)+abs(b)+eps)")
+    ax.set_ylabel("density")
+    ax.set_title(f"{dataset_name}: symmetric diff")
+    ax.legend(loc="best", frameon=True)
+    fig.tight_layout()
+    fig.savefig(prefix + "_sym_diff_hist.png", dpi=200)
+    plt.close(fig)
+
 # -----------------------------
 # 主流程
 # -----------------------------
@@ -529,13 +621,32 @@ def main(args):
             continue
 
         # 仅对 test 做推理/评估：双 bank 分别打分，然后送入已经训练好的逻辑回归分类器
-        test_scores_a, test_masks_a, y_test,  test_path_a = pcs[bank_ai].predict(test_loader)
-        test_scores_b, test_masks_b, y_test,  test_path_b = pcs[bank_nature].predict(test_loader)
+        test_scores_a, test_pixels_scores_a, y_test,  test_path_a = pcs[bank_ai].predict(test_loader)
+        test_scores_b, test_pixels_scores_b, y_test,  test_path_b = pcs[bank_nature].predict(test_loader)
 
-        features_test = build_feature_matrix(test_scores_a, test_scores_b)
+        test_scores_a_np = np.asarray(test_scores_a, dtype=float).reshape(-1)
+        test_scores_b_np = np.asarray(test_scores_b, dtype=float).reshape(-1)
+        y_test_np = np.asarray(y_test, dtype=int).reshape(-1)
+
+        if len(test_path_a) != len(test_path_b):
+            LOGGER.warning(
+                "[%s] test_path length mismatch between banks: %d vs %d",
+                ds_name,
+                len(test_path_a),
+                len(test_path_b),
+            )
+        else:
+            a_paths = [str(p) for p in test_path_a]
+            b_paths = [str(p) for p in test_path_b]
+            if a_paths != b_paths:
+                LOGGER.warning("[%s] test_path mismatch between banks; use bank_ai paths.", ds_name)
+
+        diffs = compute_relative_diffs(test_scores_a_np, test_scores_b_np, eps=float(args.diff_eps))
+
+        features_test = build_feature_matrix(test_scores_a_np, test_scores_b_np)
 
         prob_test = evaluator.predict(features_test)
-        test_auc_b, y_pred, rep_b = evaluator.evaluate(prob_test, y_test)
+        test_auc_b, y_pred, rep_b = evaluator.evaluate(prob_test, y_test_np)
 
         LOGGER.info(
             "[%s] TEST AUC=%.4f",
@@ -543,17 +654,37 @@ def main(args):
             test_auc_b,
         )
 
-        # 组合可视化注释：为每张图显示两个原始分数（ai/nature）
-        vis_ann = [
-            f"ai:{a:.3f} | nature:{b:.3f} | label_oring:{c} | label_pred:{d}"
-            for a, b, c, d in zip(test_scores_a, test_scores_b, y_test, y_pred)
-        ]
-        visualization_cache[ds_name] = {
-            "masks_a": test_masks_a,
-            "masks_b": test_masks_b,
-            "paths": [str(p) for p in test_path_a],
-            "ann": vis_ann,
-        }
+        # # 组合可视化注释：为每张图显示两个原始分数（ai/nature）与相对差分
+        # vis_ann = [
+        #     f"ai:{a:.3f} | nature:{b:.3f} | rel(a-b)/|b|:{rd:.3f} | sym:{sd:.3f} | y:{c} | pred:{d}"
+        #     for a, b, rd, sd, c, d in zip(
+        #         test_scores_a_np,
+        #         test_scores_b_np,
+        #         diffs.rel_to_b,
+        #         diffs.sym,
+        #         y_test_np,
+        #         y_pred,
+        #     )
+        # ]
+        # visualization_cache[ds_name] = {
+        #     "masks_a": test_pixels_scores_a,
+        #     "masks_b": test_pixels_scores_b,
+        #     "paths": [str(p) for p in test_path_a],
+        #     "ann": vis_ann,
+        # }
+
+        # if not args.no_diff_plots:
+        #     try:
+        #         save_diff_visualizations(
+        #             out_dir=args.diff_outdir,
+        #             dataset_name=ds_name,
+        #             scores_a=test_scores_a_np,
+        #             scores_b=test_scores_b_np,
+        #             y_true=y_test_np,
+        #             diffs=diffs,
+        #         )
+        #     except Exception as e:
+        #         LOGGER.warning("[%s] Failed to save diff plots: %s", ds_name, e)
 
         if rep_b:
             LOGGER.info("[%s] TEST report:\n%s", ds_name, rep_b)
@@ -562,8 +693,10 @@ def main(args):
         })
 
         # 累积 csv 行
-        for i, (pid, a, b, y) in enumerate(zip(test_path_a, test_scores_a, test_scores_b, y_test)):
-            row = [ds_name, str(pid), float(a), float(b), int(y), float(prob_test[i])]
+        for i, (pid, a, b, rel, sym, y) in enumerate(
+            zip(test_path_a, test_scores_a_np, test_scores_b_np, diffs.rel_to_b, diffs.sym, y_test_np)
+        ):
+            row = [ds_name, str(pid), float(a), float(b), float(rel), float(sym), int(y), float(prob_test[i])]
             csv_rows.append(row)
 
     # 保存每个测试样本的两个原始分数（ai/nature）与 LogReg 概率到 CSV（覆盖全部 test 样本）
@@ -573,7 +706,16 @@ def main(args):
             out_csv = os.path.join("runs", "test_scores.csv")
             with open(out_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                header = ["dataset", "id", "score_ai", "score_nature", "label_is_ai", "prob_logreg_ai"]
+                header = [
+                    "dataset",
+                    "id",
+                    "score_ai",
+                    "score_nature",
+                    "rel_diff_to_b",
+                    "sym_diff",
+                    "label_is_ai",
+                    "prob_logreg_ai",
+                ]
                 writer.writerow(header)
                 writer.writerows(csv_rows)
             LOGGER.info("Saved per-image test scores to %s", out_csv)
@@ -601,6 +743,8 @@ def main(args):
                 resize=args.resize,
                 imagesize=args.imagesize,
                 annotations=vis.get("ann"),
+                diff_mode="sym",
+                diff_eps=float(args.diff_eps),
             )
     except Exception as e:
         LOGGER.warning("Segmentation visualization skipped: %s", e)
@@ -612,38 +756,40 @@ if __name__ == "__main__":
     # 数据
     parser.add_argument("--data_path", type=str, default=os.path.expanduser("~/datasets/tiny_genimage"))
     parser.add_argument("--dataset_names", nargs="+", default=[
-        'adm',
-        'biggan', 
-        'glide', 
-        'midjourney', 
+        # 'adm',
+        # 'biggan', 
+        # 'glide', 
+        # 'midjourney', 
         'sdv5', 
-        'vqdm', 
-        'wukong',
+        # 'vqdm', 
+        # 'wukong',
         # 'Chameleon',
-        # 'sdv5_bigval'
+        # 'sdv5_bigval',
+        # 'sdv5 mini', 
     ], help="用于训练 PatchCore 记忆库和逻辑回归分类器的数据集名称列表（train split）。")
     parser.add_argument(
         "--test_dataset_names",
         nargs="+",
         # default=None,
         default=[
-        'adm',
-        'biggan', 
-        'glide', 
-        'midjourney', 
+        # 'adm',
+        # 'biggan', 
+        # 'glide', 
+        # 'midjourney', 
         'sdv5', 
-        'vqdm', 
-        'wukong',
-        'Chameleon',
-        'sdv5_bigval',
+        # 'vqdm', 
+        # 'wukong',
+        # 'Chameleon',
+        # 'sdv5_bigval',
+        # 'sdv5 mini', 
         ],
         help="用于推理/评估的数据集名称列表（test/val split）；若不指定，则默认与 --dataset_names 相同。",
     )
     parser.add_argument("--seed", type=int, default=0)
 
     # dataloader
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--workers", type=int, default=14)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--workers", type=int, default=13)
     parser.add_argument("--resize", type=int, default=256)
     parser.add_argument("--imagesize", type=int, default=224)
 
@@ -675,7 +821,7 @@ if __name__ == "__main__":
                         help="预处理输出维度；设为 0 时按选定层的通道数自动推断")
     parser.add_argument("--target_embed_dimension", type=int, default=512)
     parser.add_argument("--patchsize", type=int, default=3)
-    parser.add_argument("--anomaly_scorer_k", type=int, default=3)
+    parser.add_argument("--anomaly_scorer_k", type=int, default=20)
 
     # 逻辑回归分类器 / 阶段控制相关：
     #   - phase = train ：在公共 train 上（按比例采样）训练 PatchCore 记忆库 + 逻辑回归，并保存到磁盘；
@@ -683,7 +829,7 @@ if __name__ == "__main__":
     #   - phase = both  ：先执行 train 流程，再在同一次运行中立即执行 infer 流程（默认行为）。
     parser.add_argument(
         "--phase",type=str,choices=["train", "infer", "both"],
-        default="infer",
+        default="both",
         help=("运行阶段：'train' 仅训练 PatchCore 记忆库和逻辑回归；"
             "'infer' 仅加载已训练模型并在 test 上推理/评估；"
             "'both' 先训练再在同一次运行中执行推理/评估（默认）。"))
@@ -702,6 +848,20 @@ if __name__ == "__main__":
         help="用于训练逻辑回归分类器的训练集采样比例 (0,1]，例如 0.1 表示随机采样 10% 的 train 样本。",
     )
 
+    # score diff 可视化
+    parser.add_argument("--diff_eps", type=float, default=1e-6, help="相对差分计算的 eps（防止除零）。")
+    parser.add_argument(
+        "--diff_outdir",
+        type=str,
+        default=os.path.join(HOME, "runs", "diff_viz"),
+        help="保存 score scatter / diff 直方图的目录。",
+    )
+    parser.add_argument(
+        "--no_diff_plots",
+        action="store_true",
+        help="关闭 (score_ai, score_nature) 的相对差分可视化图保存。",
+    )
+
     # sampler / coreset
     parser.add_argument("--sampler_name", 
                         # default="central",
@@ -710,7 +870,7 @@ if __name__ == "__main__":
                         default="random",
                         # default="pca"
                         )
-    parser.add_argument("--coreset_percentage", type=float, default=0.001)
+    parser.add_argument("--coreset_percentage", type=float, default=0.1)
     # FAISS / 设备
     parser.add_argument("--faiss_on_gpu", action="store_true")
     parser.add_argument("--faiss_num_workers", type=int, default=12)
