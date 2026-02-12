@@ -1,4 +1,4 @@
-# patchcore/datasets/tiny_genimage.py
+# wat/datasets/tiny_genimage.py
 import os, random
 from enum import Enum
 from typing import List, Tuple, Optional
@@ -8,7 +8,6 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 from PIL import Image
 from torchvision import transforms as T
-import torchvision.transforms.functional as TF
 
 
 class DatasetSplit(Enum):
@@ -39,6 +38,8 @@ class Dataset(TorchDataset):
     ) -> None:
         super().__init__()
         self.source = source
+        # 约定：generator 标签取数据集根目录名（split 的父目录），例如 .../tiny_genimage/sdv5/train/ai/*.png -> sdv5
+        self.dataset_name = os.path.basename(os.path.normpath(self.source))
         self.resize = int(resize)
         self.imagesize = int(imagesize)
         self.split = split
@@ -53,9 +54,6 @@ class Dataset(TorchDataset):
                 T.Resize(self.resize, interpolation=T.InterpolationMode.BILINEAR),
                 T.CenterCrop(self.imagesize),
 
-                # 改为随机集剪裁
-                # T.Lambda(lambda im: random_crop_single(im, self.imagesize)),
-
                 T.ToTensor(), # 将图像转换为 PyTorch 的张量（Tensor），并且会将图像的像素值从 [0, 255] 的范围转换到 [0.0, 1.0]
                 T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ]
@@ -64,7 +62,7 @@ class Dataset(TorchDataset):
         # 读取文件列表 + 标签
         self.imgpaths = self.get_image_data()
 
-    def get_image_data(self) -> List[Tuple[str, str]]:
+    def get_image_data(self) -> List[Tuple[str, str, str]]:
         """
         imgpaths: list of (type_name, abs_image_path)
         labels_gt:
@@ -86,14 +84,30 @@ class Dataset(TorchDataset):
         if self.split == DatasetSplit.TRAIN and self.bankname is not None:
             type_dirs = [self.bankname]
 
-        imgpaths: List[Tuple[str, str]] = []
+        imgpaths: List[Tuple[str, str, str]] = []
 
         for t in type_dirs:
             t_dir = os.path.join(split_dir, t)
-            files = sorted(os.listdir(t_dir))
-            for f in files:
-                p = os.path.join(t_dir, f)
-                imgpaths.append((t, p))
+            if not os.path.isdir(t_dir):
+                continue
+
+            # 支持一层生成器子目录：split/ai/<generator>/*.png
+            subdirs = [
+                d for d in sorted(os.listdir(t_dir))
+                if os.path.isdir(os.path.join(t_dir, d))
+            ]
+            if subdirs:
+                for gen in subdirs:
+                    gen_dir = os.path.join(t_dir, gen)
+                    for f in sorted(os.listdir(gen_dir)):
+                        p = os.path.join(gen_dir, f)
+                        imgpaths.append((t, gen, p))
+            else:
+                # 没有子目录则直接读文件：split/ai/*.png 或 split/nature/*.png
+                for f in sorted(os.listdir(t_dir)):
+                    p = os.path.join(t_dir, f)
+                    # ai 的 generator 从数据集根目录名取；nature 统一为 nature
+                    imgpaths.append((t, "nature" if t == "nature" else self.dataset_name, p))
         print(f"[tiny_genimage] Loaded {len(imgpaths)} items from {split_dir} "
             f"(memorybank={self.bankname}, split={self.split.value})")
         return imgpaths
@@ -102,11 +116,8 @@ class Dataset(TorchDataset):
         return len(self.imgpaths)
 
     def __getitem__(self, idx: int):
-        t, image_path = self.imgpaths[idx]
-        # TODO: lab 
-        image_types = 'RGB'   # 修改图片格式RGB
-        # image_types = 'HSV'   # 修改图片格式
-        # image_types = 'YCbCr'   # 修改图片格式YCbCr
+        t, generator, image_path = self.imgpaths[idx]
+        image_types = "RGB"
         try:
             # 读图更稳健一点
             with Image.open(image_path) as im:
@@ -126,32 +137,8 @@ class Dataset(TorchDataset):
             "image": image,
             "is_ai": is_ai,
             "is_anomaly": is_anomaly,
+            "generator": generator if is_ai else "nature",
+            "dataset_name": self.dataset_name,
             "image_name": "/".join(image_path.replace("\\", "/").split("/")[-4:]),
             "image_path": image_path,
         }
-
-
-def random_crop_single(image: Image.Image, crop_size: int) -> Image.Image:
-    """
-    随机裁剪出一块 crop_size x crop_size 的区域；
-    若原图较小则先等比放大到短边>=crop_size，尽量避免无谓的 resize。
-    """
-    w, h = image.size
-    if w < crop_size or h < crop_size:
-        scale = crop_size / min(w, h)
-        new_w = max(crop_size, int(round(w * scale)))
-        new_h = max(crop_size, int(round(h * scale)))
-        image = TF.resize(
-            image,
-            size=(new_h, new_w),
-            interpolation=T.InterpolationMode.BILINEAR,
-            antialias=True,
-        )
-        w, h = image.size
-
-    if w == crop_size and h == crop_size:
-        return image
-
-    top = random.randint(0, h - crop_size)
-    left = random.randint(0, w - crop_size)
-    return TF.crop(image, top, left, crop_size, crop_size)

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from patchcore import common
+from wat import common
 
 
 def test_calling_without_setting_index():

@@ -1,5 +1,4 @@
-# run_patchcore.py
-from json import load
+# run_wat.py
 import os
 import argparse
 import logging
@@ -7,26 +6,38 @@ from typing import Dict, Any, Tuple, Callable, List, Optional
 
 import numpy as np
 import torch
-from sklearn.metrics import classification_report, roc_auc_score
 import csv
-from dataclasses import dataclass
 
-import patchcore.backbones
-import patchcore.common
-import patchcore.metrics
-import patchcore.patchcore
-import patchcore.sampler
-from patchcore.evaluation import Evaluator, build_feature_matrix
-from patchcore.datasets.tiny_genimage import Dataset, DatasetSplit
-import patchcore.utils
+import wat.backbones
+import wat.common
+import wat.wat
+import wat.sampler
+from wat.datasets.tiny_genimage import Dataset, DatasetSplit
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-LOGGER = logging.getLogger("run_patchcore")
+LOGGER = logging.getLogger("run_wat")
+
+def roc_auc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """纯 numpy AUROC（避免硬依赖 sklearn）；y_true 必须是 {0,1}。"""
+    y_true = np.asarray(y_true).reshape(-1).astype(int)
+    y_score = np.asarray(y_score).reshape(-1).astype(float)
+    if y_true.size == 0:
+        return float("nan")
+    n_pos = int((y_true == 1).sum())
+    n_neg = int((y_true == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    order = np.argsort(y_score)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(1, len(y_score) + 1, dtype=np.float64)
+    sum_ranks_pos = float(ranks[y_true == 1].sum())
+    return (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
 
 # -----------------------------
-# FAISS NN 选择
+# KNN 选择（优先 FAISS，缺失则退回 BruteNN）
 # -----------------------------
 def choose_nn_method(
     nn: str,
@@ -35,36 +46,24 @@ def choose_nn_method(
     faiss_on_gpu: bool,
     faiss_num_workers: int,
 ):
-    """根据特征维度与样本量，选择最合适的 FAISS 索引实现。"""
-    from patchcore import common as pc_common
-
-    SMALL_N = 50000
-    dim_ok_for_pq = (target_embed_dimension % 64 == 0)  # 本实现 PQ 的 M=64，需 d%64==0
-
-    if nn == "flat":
-        return pc_common.FaissNN(on_gpu=faiss_on_gpu, num_workers=faiss_num_workers)
-
-    if nn == "ivfpq":
-        if not dim_ok_for_pq or est_num_features < SMALL_N:
-            LOGGER.warning(
-                "Requested ivfpq 但 d%%64==0 和/或样本量不足未满足：d=%d, estN=%d。回退 Flat。",
-                target_embed_dimension, est_num_features,
-            )
-            return pc_common.FaissNN(on_gpu=faiss_on_gpu, num_workers=faiss_num_workers)
-        return pc_common.ApproximateFaissNN(on_gpu=faiss_on_gpu, num_workers=faiss_num_workers)
-
-    # auto
-    if dim_ok_for_pq and est_num_features >= SMALL_N:
-        return pc_common.ApproximateFaissNN(on_gpu=faiss_on_gpu, num_workers=faiss_num_workers)
-    else:
-        return pc_common.FaissNN(on_gpu=faiss_on_gpu, num_workers=faiss_num_workers)
+    """根据配置选择 KNN 方法。"""
+    common = wat.common
+    if nn == "faiss" or nn == "ivfpq" or nn == "flat":
+        if common.HAS_FAISS:
+            return common.FaissNN(on_gpu=faiss_on_gpu, num_workers=faiss_num_workers)
+        LOGGER.warning("faiss 未安装，回退 BruteNN。")
+        return common.BruteNN()
+    # auto：若装了 faiss 且数据量较大，优先 faiss
+    if common.HAS_FAISS and est_num_features > 50000:
+        return common.FaissNN(on_gpu=faiss_on_gpu, num_workers=faiss_num_workers)
+    return common.BruteNN()
 
 
 # -----------------------------
 # 推断输入形状
 # -----------------------------
 def infer_input_shape(dl):
-    """从任意 DataLoader 抽一批数据，推断 PatchCore 期望的 (C,H,W)。"""
+    """从任意 DataLoader 抽一批数据，推断 WAT 期望的 (C,H,W)。"""
     x = next(iter(dl))
     if isinstance(x, dict):
         x = x.get("image", next(iter(x.values())))
@@ -78,9 +77,9 @@ def infer_input_shape(dl):
 
 
 # -----------------------------
-# PatchCore 构造器
+# WAT 构造器
 # -----------------------------
-def get_patchcore(
+def get_wat(
     backbone_name: str,
     layers_to_extract_from: List[str],
     pretrain_embed_dimension: int,
@@ -89,11 +88,11 @@ def get_patchcore(
     anomaly_scorer_k: int,
 ):
     def _builder(input_shape: Tuple[int, int, int], featuresampler, device: torch.device, nn_method):
-        """闭包：按输入形状动态构造 PatchCore 并加载对应骨干网络。"""
-        backbone = patchcore.backbones.load(backbone_name)
+        """闭包：按输入形状动态构造 WAT 并加载对应骨干网络。"""
+        backbone = wat.backbones.load(backbone_name)
         backbone.name = backbone_name
 
-        pc = patchcore.patchcore.PatchCore(device)
+        pc = wat.wat.WAT(device)
         pc.load(
             backbone=backbone,
             layers_to_extract_from=layers_to_extract_from,
@@ -117,14 +116,14 @@ def get_sampler(name: str, percentage: float, device: torch.device):
     """根据配置返回特征采样器，主要用于控制记忆库容量。"""
     name = name.lower()
     if name == "pca":
-        return patchcore.common.PCASampler(percentage)
+        return wat.common.PCASampler(percentage)
     if name == "random":
-        return patchcore.sampler.RandomSampler(percentage)
+        return wat.sampler.RandomSampler(percentage)
     # 中心采样：主体优先
     if name == "central":
-        return patchcore.sampler.CentralSampler(percentage, use_mahalanobis=False)
+        return wat.sampler.CentralSampler(percentage, use_mahalanobis=False)
     if name == "central_mahal":
-        return patchcore.sampler.CentralSampler(percentage, use_mahalanobis=True)
+        return wat.sampler.CentralSampler(percentage, use_mahalanobis=True)
     # 密度采样：高密度优先（可带后缀 n_neighbors，如 density:10）
     if name.startswith("density"):
         n_neighbors = 50
@@ -133,7 +132,7 @@ def get_sampler(name: str, percentage: float, device: torch.device):
                 n_neighbors = int(name.split(":", 1)[1])
             except Exception:
                 pass
-        return patchcore.sampler.DensitySampler(percentage, n_neighbors=n_neighbors)
+        return wat.sampler.DensitySampler(percentage, n_neighbors=n_neighbors)
     # KMeans / TopC：kmeans_topc[:C]（默认 C=2），普通 kmeans 等同于 topc:1
     if name.startswith("kmeans_topc") or name == "kmeans":
         topk = 1
@@ -144,7 +143,7 @@ def get_sampler(name: str, percentage: float, device: torch.device):
                     topk = int(name.split(":", 1)[1])
                 except Exception:
                     pass
-        km = patchcore.sampler.KMeansSampler(percentage, per_cluster_topk=topk)
+        km = wat.sampler.KMeansSampler(percentage, per_cluster_topk=topk)
         # 默认用 MiniBatchKMeans，提高大规模性能
         km.use_minibatch = True
         return km
@@ -303,115 +302,14 @@ def get_dataloaders(
     return return_dataloaders
 
 
-def train_memorybank(build_pc_fn, sampler, device, nn_method, train_loader) -> patchcore.patchcore.PatchCore:
+def train_memorybank(build_pc_fn, sampler, device, nn_method, train_loader) -> wat.wat.WAT:
     """单独训练某个记忆库：提取训练集特征并填充 KNN 内存。"""
     input_shape = infer_input_shape(train_loader)
     pc = build_pc_fn(input_shape=input_shape, featuresampler=sampler, device=device, nn_method=nn_method)
     pc.fit(train_loader)  # 记忆库构建
     return pc
 
-def get_image_scores(patchcore_model, dataloader) -> np.ndarray:
-    """
-    用某个 PatchCore 模型（某 bank 的“正常库”）对 dataloader 打分，返回图像级异常分。
-    - 不依赖 predict 返回的 labels，避免“相对/绝对”语义混淆。
-    - 对 NaN/Inf 做填充，保证后续统计稳定。
-    """
-    prediction = patchcore_model.predict(dataloader)
-    image_scores = np.asarray(prediction[0], dtype=float).reshape(-1)
-    image_scores = np.asarray(image_scores, dtype=float).reshape(-1)
 
-    return image_scores
-
-
-@dataclass(frozen=True)
-class RelativeDiffResult:
-    rel_to_b: np.ndarray
-    sym: np.ndarray
-
-
-def compute_relative_diffs(
-    scores_a: np.ndarray,
-    scores_b: np.ndarray,
-    *,
-    eps: float = 1e-8,
-) -> RelativeDiffResult:
-    """
-    给两套 bank 的图像级分数计算“相对差分”：
-    - rel_to_b: (a-b)/(abs(b)+eps)   （以 b 为参照的相对变化）
-    - sym:      (a-b)/(abs(a)+abs(b)+eps) （对称归一化，数值更稳定）
-    """
-    a = np.asarray(scores_a, dtype=float).reshape(-1)
-    b = np.asarray(scores_b, dtype=float).reshape(-1)
-    rel_to_b = (a - b) / (np.abs(b) + eps)
-    sym = (a - b) / (np.abs(a) + np.abs(b) + eps)
-    return RelativeDiffResult(rel_to_b=rel_to_b, sym=sym)
-
-
-def save_diff_visualizations(
-    *,
-    out_dir: str,
-    dataset_name: str,
-    scores_a: np.ndarray,
-    scores_b: np.ndarray,
-    y_true: np.ndarray,
-    diffs: RelativeDiffResult,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    os.makedirs(out_dir, exist_ok=True)
-    prefix = os.path.join(out_dir, dataset_name)
-
-    a = np.asarray(scores_a, dtype=float).reshape(-1)
-    b = np.asarray(scores_b, dtype=float).reshape(-1)
-    y = np.asarray(y_true).reshape(-1)
-
-    # 1) scatter: score_ai vs score_nature
-    fig, ax = plt.subplots(figsize=(6, 6))
-    for cls, color, name in [(0, "tab:blue", "nature"), (1, "tab:orange", "ai")]:
-        mask = (y == cls)
-        if mask.any():
-            ax.scatter(b[mask], a[mask], s=12, alpha=0.6, c=color, label=f"label={name}")
-    mn = float(np.nanmin(np.concatenate([a, b])))
-    mx = float(np.nanmax(np.concatenate([a, b])))
-    ax.plot([mn, mx], [mn, mx], "--", linewidth=1, color="gray", label="a=b")
-    ax.set_xlabel("score_nature (bank B)")
-    ax.set_ylabel("score_ai (bank A)")
-    ax.set_title(f"{dataset_name}: score scatter")
-    ax.legend(loc="best", frameon=True)
-    fig.tight_layout()
-    fig.savefig(prefix + "_scatter.png", dpi=200)
-    plt.close(fig)
-
-    # 2) histogram: rel diff by class
-    fig, ax = plt.subplots(figsize=(7, 4))
-    rel = diffs.rel_to_b.reshape(-1)
-    bins = 60
-    for cls, color, name in [(0, "tab:blue", "nature"), (1, "tab:orange", "ai")]:
-        mask = (y == cls)
-        if mask.any():
-            ax.hist(rel[mask], bins=bins, alpha=0.55, color=color, label=f"label={name}", density=True)
-    ax.set_xlabel("(a-b)/(abs(b)+eps)")
-    ax.set_ylabel("density")
-    ax.set_title(f"{dataset_name}: relative diff")
-    ax.legend(loc="best", frameon=True)
-    fig.tight_layout()
-    fig.savefig(prefix + "_rel_diff_hist.png", dpi=200)
-    plt.close(fig)
-
-    # 3) histogram: symmetric diff by class
-    fig, ax = plt.subplots(figsize=(7, 4))
-    sym = diffs.sym.reshape(-1)
-    for cls, color, name in [(0, "tab:blue", "nature"), (1, "tab:orange", "ai")]:
-        mask = (y == cls)
-        if mask.any():
-            ax.hist(sym[mask], bins=bins, alpha=0.55, color=color, label=f"label={name}", density=True)
-    ax.set_xlabel("(a-b)/(abs(a)+abs(b)+eps)")
-    ax.set_ylabel("density")
-    ax.set_title(f"{dataset_name}: symmetric diff")
-    ax.legend(loc="best", frameon=True)
-    fig.tight_layout()
-    fig.savefig(prefix + "_sym_diff_hist.png", dpi=200)
-    plt.close(fig)
 
 # -----------------------------
 # 主流程
@@ -420,11 +318,10 @@ def main(args):
     """
     主流程：
         - phase == 'train'：
-            1) 在指定 train 数据集上，为每个 bank 训练 PatchCore 记忆库并保存到磁盘；
-            2) 在“公共 train”（不区分 bank）的一个子集上训练逻辑回归分类器，并保存到磁盘。
+            1) 在指定 train 数据集上，为每个 bank 训练 WAT 记忆库并保存到磁盘；
         - phase == 'infer'：
-            1) 从磁盘加载已训练好的 PatchCore 记忆库和逻辑回归分类器；
-            2) 在指定 test 数据集上执行推理/评估（不再依赖 val）。
+            1) 从磁盘加载已训练好的 WAT 记忆库；
+            2) 在指定 test/val split 上执行推理/评估。
     """
     np.seterr(all='raise')
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -452,11 +349,11 @@ def main(args):
     sampler = get_sampler(args.sampler_name, args.coreset_percentage, device)
 
     # -----------------------------
-    # Phase 1: 训练 PatchCore 记忆库 + 逻辑回归分类器，并保存到磁盘
+    # Phase 1: 训练 WAT 记忆库 + 逻辑回归分类器，并保存到磁盘
     # -----------------------------
     if args.phase in ("train", "both"):
-        # 1) 构建 PatchCore builder，用于后续为各 bank 训练记忆库
-        build_pc = get_patchcore(
+        # 1) 构建 WAT builder，用于后续为各 bank 训练记忆库
+        build_pc = get_wat(
             backbone_name=args.backbone_name,
             layers_to_extract_from=args.layers_to_extract_from,
             pretrain_embed_dimension=args.pretrain_embed_dimension,
@@ -475,8 +372,8 @@ def main(args):
             workers=args.workers,
         )
 
-        # 3) 为每个 bank 训练一个 PatchCore 记忆库，并保存到磁盘
-        pcs: Dict[str, patchcore.patchcore.PatchCore] = {}
+        # 3) 为每个 bank 训练一个 WAT 记忆库，并保存到磁盘
+        pcs: Dict[str, wat.wat.WAT] = {}
         for bank in banknames:
             loaders_for_bank = build_dataloader_train(seed=args.seed, bankname=bank)
             estN = len(loaders_for_bank["train"].dataset)
@@ -494,102 +391,35 @@ def main(args):
                 save_dir = os.path.join(args.pc_save_root, bank)
                 os.makedirs(save_dir, exist_ok=True)
                 pc.save_to_path(save_dir)
-                LOGGER.info("Saved PatchCore memory bank for '%s' to %s", bank, save_dir)
+                LOGGER.info("Saved WAT memory bank for '%s' to %s", bank, save_dir)
 
             pcs[bank] = pc
 
-        # 4) 公共 Loader（不筛 bank），从“训练数据集列表”构建：
-        #    - 用于给逻辑回归分类器提供训练数据（只采样一部分 train）。
-        common_loaders = build_dataloader_train(seed=args.seed, bankname=None)
-
-        # 1) 取“公共 train”作为分类器可用的样本池（包含 ai/nature 两类）
-        base_train_loader = common_loaders["train"]
-        base_train_dataset = base_train_loader.dataset
-        total_train = len(base_train_dataset)
-        if total_train == 0:
-            raise RuntimeError("No training samples found for classifier training.")
-
-        # 2) 按给定比例随机采样一部分样本用来训练逻辑回归（避免全量 train 过拟合 / 过慢）
-        frac = float(args.cls_train_fraction)
-        if not (0.0 < frac <= 1.0):
-            raise ValueError(f"cls_train_fraction must be in (0,1], got {frac}.")
-        n_sample = max(1, int(total_train * frac))
-
-        rng = np.random.default_rng(args.seed)
-        sampled_indices = rng.choice(total_train, size=n_sample, replace=False)
-        sampled_dataset = torch.utils.data.Subset(base_train_dataset, sampled_indices)
-        sampled_loader = torch.utils.data.DataLoader(
-            sampled_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,          # 保持顺序一致，便于双 bank 对齐
-            num_workers=args.workers,
-            pin_memory=True,
-            drop_last=False,
-        )
-        LOGGER.info(
-            "Training logistic classifier on %d / %d train samples (fraction=%.3f).",
-            n_sample,
-            total_train,
-            frac,
-        )
-
-        # 3) 从原始数据集中直接读取标签（is_ai），避免重复依赖 PatchCore.predict 的返回结构
-        y_train_list: List[int] = []
-        for idx in sampled_indices:
-            sample = base_train_dataset[idx]
-            if isinstance(sample, dict):
-                label = sample.get("is_ai")
-            else:
-                # 兼容形如 (image, label, ...) 的返回格式
-                label = sample[1] if len(sample) > 1 else 0
-            if isinstance(label, torch.Tensor):
-                label = int(label.item())
-            else:
-                label = int(label)
-            y_train_list.append(label)
-        y_train = np.asarray(y_train_list, dtype=int).reshape(-1)
-
-        # 4) 用两套 PatchCore 记忆库分别对这部分样本打分，得到 (score_ai, score_nature)
-        #    这里使用辅助函数 get_image_scores，仅取图像级分数，避免在此处重复解析 predict 的完整返回。
-        train_scores_a = get_image_scores(pcs[bank_ai], sampled_loader)
-        train_scores_b = get_image_scores(pcs[bank_nature], sampled_loader)
-
-        features_train = build_feature_matrix(
-            np.asarray(train_scores_a, dtype=float),
-            np.asarray(train_scores_b, dtype=float),
-        )
-
-        # 5) 构建 Evaluator，训练逻辑回归分类器并保存到指定路径
-        if args.classifier_path:
-            os.makedirs(os.path.dirname(args.classifier_path), exist_ok=True)
-        evaluator = Evaluator(save_classifier_path=args.classifier_path)
-        evaluator.fit(features_train, y_train)
-
-        # 若仅训练，则此处结束；若 phase == "both"，则继续进入推理阶段。
+        # 训练阶段只需写出记忆库
         if args.phase == "train":
             return
 
     # -----------------------------
     # Phase 2: 仅推理/评估
-    #   - 假设 PatchCore 记忆库与逻辑回归分类器已在 Phase 1 中训练好并保存；
-    #   - 这里只负责：加载 PatchCore + 分类器，在指定 test 数据集上做推理/评估；
-    #   - 不再依赖 val。
+    #   - 假设 WAT 记忆库已在 Phase 1 中训练好并保存；
+    #   - 这里只负责：加载 WAT 记忆库，在 test 上做推理/评估；
+    #   - 不再依赖 val，也无需额外分类器。
     # -----------------------------
     if args.phase not in ("infer", "both"):
         raise ValueError(f"Unknown phase: {args.phase}. Expected 'train', 'infer' or 'both'.")
 
-    # 1) 从磁盘加载 PatchCore 记忆库（每个 bank 一份）
+    # 1) 从磁盘加载 WAT 记忆库（每个 bank 一份）
     if not args.pc_save_root:
-        raise RuntimeError("Phase 'infer' requires a valid --pc_save_root to load PatchCore memory banks.")
+        raise RuntimeError("Phase 'infer' requires a valid --pc_save_root to load WAT memory banks.")
 
-    pcs: Dict[str, patchcore.patchcore.PatchCore] = {}
+    pcs: Dict[str, wat.wat.WAT] = {}
     for bank in banknames:
         load_dir = os.path.join(args.pc_save_root, bank)
-        nn_method = patchcore.common.FaissNN(on_gpu=args.faiss_on_gpu, num_workers=args.faiss_num_workers)
-        pc = patchcore.patchcore.PatchCore(device)
+        nn_method = wat.common.BruteNN()
+        pc = wat.wat.WAT(device)
         pc.load_from_path(load_path=load_dir, device=device, nn_method=nn_method)
         pcs[bank] = pc
-        LOGGER.info("Loaded PatchCore memory bank for '%s' from %s", bank, load_dir)
+        LOGGER.info("Loaded WAT memory bank for '%s' from %s", bank, load_dir)
 
     # 2) 基于“测试数据集列表”构建 DataLoader 工厂，并拿到公共 test Loader
     build_dataloader_test = get_dataloaders(
@@ -602,17 +432,15 @@ def main(args):
     )
     common_loaders = build_dataloader_test(seed=args.seed, bankname=None)
 
-    # 3) 加载已经训练好的逻辑回归分类器
-    if not args.classifier_path:
-        raise RuntimeError("Phase 'infer' requires a valid --classifier_path to load the trained classifier.")
-
-    evaluator = Evaluator(save_classifier_path=args.classifier_path)
-    evaluator.load_classifier(args.classifier_path)
-    LOGGER.info("Loaded logistic classifier from: %s", args.classifier_path)
-
     summary_logs: Dict[str, float] = {}
-    visualization_cache: Dict[str, Dict[str, Any]] = {}
+    genacc_logs: Dict[str, float] = {}
     csv_rows: List[List[Any]] = []
+    all_labels: List[int] = []
+    all_preds: List[int] = []
+    all_gen_gt: List[str] = []
+    all_gen_pred: List[str] = []
+    all_gen_is_ai: List[int] = []
+    all_gen_is_tp_ai: List[int] = []
 
     for ds_name in test_dataset_names:
         test_loader = common_loaders["test"].get(ds_name)
@@ -620,86 +448,76 @@ def main(args):
             LOGGER.warning("Dataset %s missing test loader, skip evaluation.", ds_name)
             continue
 
-        # 仅对 test 做推理/评估：双 bank 分别打分，然后送入已经训练好的逻辑回归分类器
-        test_scores_a, test_pixels_scores_a, y_test,  test_path_a = pcs[bank_ai].predict(test_loader)
-        test_scores_b, test_pixels_scores_b, y_test,  test_path_b = pcs[bank_nature].predict(test_loader)
+        # 仅对 test 做推理/评估：双 bank 分别打分
+        (
+            test_scores_a,
+            _,
+            y_test,
+            test_path_a,
+            gen_pred_a,
+            gen_conf_a,
+            gt_generators,
+            gt_dataset_names,
+        ) = pcs[bank_ai].predict_with_meta(test_loader)
+        test_scores_b, _, y_test, test_path_b, nat_pred_b, nat_conf_b, _, _ = pcs[bank_nature].predict_with_meta(test_loader)
 
         test_scores_a_np = np.asarray(test_scores_a, dtype=float).reshape(-1)
         test_scores_b_np = np.asarray(test_scores_b, dtype=float).reshape(-1)
         y_test_np = np.asarray(y_test, dtype=int).reshape(-1)
 
-        if len(test_path_a) != len(test_path_b):
-            LOGGER.warning(
-                "[%s] test_path length mismatch between banks: %d vs %d",
+        preds = (test_scores_a_np < test_scores_b_np).astype(int)  # 更接近 ai bank 即判为 ai=1
+        acc = float((preds == y_test_np).mean()) if len(y_test_np) else 0.0
+        auc = roc_auc_binary(y_test_np, (test_scores_b_np - test_scores_a_np))
+
+        summary_logs[ds_name] = acc
+        LOGGER.info("[%s] acc=%.4f, auc=%.4f", ds_name, acc, auc)
+
+        all_labels.extend(y_test_np.tolist())
+        all_preds.extend(preds.tolist())
+
+        paths = [str(p) for p in test_path_a] if test_path_a is not None else ["-"] * len(preds)
+        gen_a = gen_pred_a or ["unknown"] * len(preds)
+        gen_a_conf = gen_conf_a or [float("nan")] * len(preds)
+        nat_b = nat_pred_b or ["nature"] * len(preds)
+        gt_gen = gt_generators or ["unknown"] * len(preds)
+        gt_ds = gt_dataset_names or [ds_name] * len(preds)
+
+        # generator accuracy：只在真实 AI 样本上统计（nature 没有 generator 语义）
+        try:
+            ga_np = np.asarray([str(x) for x in gen_a], dtype=object)
+            gg_np = np.asarray([str(x) for x in gt_gen], dtype=object)
+            is_ai = (y_test_np == 1)
+            is_tp_ai = is_ai & (preds == 1)
+            n_ai = int(is_ai.sum())
+            n_tp_ai = int(is_tp_ai.sum())
+            gen_acc_ai = float((ga_np[is_ai] == gg_np[is_ai]).mean()) if n_ai else float("nan")
+            gen_acc_tp = float((ga_np[is_tp_ai] == gg_np[is_tp_ai]).mean()) if n_tp_ai else float("nan")
+            genacc_logs[ds_name] = gen_acc_ai
+            LOGGER.info(
+                "[%s] gen_acc(gt_ai)=%.4f (n=%d) | gen_acc(tp_ai)=%.4f (n=%d)",
                 ds_name,
-                len(test_path_a),
-                len(test_path_b),
+                gen_acc_ai,
+                n_ai,
+                gen_acc_tp,
+                n_tp_ai,
             )
-        else:
-            a_paths = [str(p) for p in test_path_a]
-            b_paths = [str(p) for p in test_path_b]
-            if a_paths != b_paths:
-                LOGGER.warning("[%s] test_path mismatch between banks; use bank_ai paths.", ds_name)
+            all_gen_gt.extend(gg_np.tolist())
+            all_gen_pred.extend(ga_np.tolist())
+            all_gen_is_ai.extend(is_ai.astype(int).tolist())
+            all_gen_is_tp_ai.extend(is_tp_ai.astype(int).tolist())
+        except Exception as e:
+            LOGGER.warning("[%s] Failed to compute generator accuracy: %s", ds_name, e)
 
-        diffs = compute_relative_diffs(test_scores_a_np, test_scores_b_np, eps=float(args.diff_eps))
-
-        features_test = build_feature_matrix(test_scores_a_np, test_scores_b_np)
-
-        prob_test = evaluator.predict(features_test)
-        test_auc_b, y_pred, rep_b = evaluator.evaluate(prob_test, y_test_np)
-
-        LOGGER.info(
-            "[%s] TEST AUC=%.4f",
-            ds_name,
-            test_auc_b,
-        )
-
-        # # 组合可视化注释：为每张图显示两个原始分数（ai/nature）与相对差分
-        # vis_ann = [
-        #     f"ai:{a:.3f} | nature:{b:.3f} | rel(a-b)/|b|:{rd:.3f} | sym:{sd:.3f} | y:{c} | pred:{d}"
-        #     for a, b, rd, sd, c, d in zip(
-        #         test_scores_a_np,
-        #         test_scores_b_np,
-        #         diffs.rel_to_b,
-        #         diffs.sym,
-        #         y_test_np,
-        #         y_pred,
-        #     )
-        # ]
-        # visualization_cache[ds_name] = {
-        #     "masks_a": test_pixels_scores_a,
-        #     "masks_b": test_pixels_scores_b,
-        #     "paths": [str(p) for p in test_path_a],
-        #     "ann": vis_ann,
-        # }
-
-        # if not args.no_diff_plots:
-        #     try:
-        #         save_diff_visualizations(
-        #             out_dir=args.diff_outdir,
-        #             dataset_name=ds_name,
-        #             scores_a=test_scores_a_np,
-        #             scores_b=test_scores_b_np,
-        #             y_true=y_test_np,
-        #             diffs=diffs,
-        #         )
-        #     except Exception as e:
-        #         LOGGER.warning("[%s] Failed to save diff plots: %s", ds_name, e)
-
-        if rep_b:
-            LOGGER.info("[%s] TEST report:\n%s", ds_name, rep_b)
-        summary_logs.update({
-            f"{ds_name}_logreg_test_auc": float(test_auc_b),
-        })
-
-        # 累积 csv 行
-        for i, (pid, a, b, rel, sym, y) in enumerate(
-            zip(test_path_a, test_scores_a_np, test_scores_b_np, diffs.rel_to_b, diffs.sym, y_test_np)
+        for path, sa, sb, yt, pr, ga, gc, nb, ggt, dgt in zip(
+            paths, test_scores_a_np, test_scores_b_np, y_test_np, preds, gen_a, gen_a_conf, nat_b, gt_gen, gt_ds
         ):
-            row = [ds_name, str(pid), float(a), float(b), float(rel), float(sym), int(y), float(prob_test[i])]
-            csv_rows.append(row)
+            rel = (sa - sb) / (abs(sb) + 1e-8)
+            sym = (sa - sb) / (abs(sa) + abs(sb) + 1e-8)
+            pred_gen = ga if int(pr) == 1 else "nature"
+            csv_rows.append([ds_name, path, sa, sb, rel, sym, yt, pr, pred_gen, ga, gc, nb, ggt, dgt])
 
-    # 保存每个测试样本的两个原始分数（ai/nature）与 LogReg 概率到 CSV（覆盖全部 test 样本）
+
+    # 保存每个测试样本的两个原始分数到 CSV（覆盖全部 test 样本）
     try:
         if csv_rows:
             os.makedirs("runs", exist_ok=True)
@@ -714,7 +532,13 @@ def main(args):
                     "rel_diff_to_b",
                     "sym_diff",
                     "label_is_ai",
-                    "prob_logreg_ai",
+                    "pred_is_ai",
+                    "pred_generator",
+                    "ai_generator",
+                    "ai_generator_conf",
+                    "nature_label",
+                    "gt_generator",
+                    "gt_dataset_name",
                 ]
                 writer.writerow(header)
                 writer.writerows(csv_rows)
@@ -722,51 +546,69 @@ def main(args):
     except Exception as e:
         LOGGER.warning("Failed to save per-image test scores: %s", e)
 
-    # 上文已在分支中完成评估，这里统一打印 summary（若存在）
+    # 打印 summary 与全局精度
     try:
-        if 'summary_logs' in locals() and summary_logs:
-            LOGGER.info("Summary: %s", {k: round(v, 6) for k, v in summary_logs.items()})
+        if summary_logs:
+            LOGGER.info("Per-dataset acc: %s", {k: round(v, 6) for k, v in summary_logs.items()})
     except Exception:
         pass
 
-    # 按数据集分别做可视化
     try:
-        if not visualization_cache:
-            raise RuntimeError("visualization cache is empty (no predictions recorded).")
-        for ds_name, vis in visualization_cache.items():
-            patchcore.utils.plot_random_segmentations(
-                image_paths=vis["paths"],
-                segmentations_a=vis["masks_a"],
-                segmentations_b=vis["masks_b"],
-                savefolder=os.path.join("output_images", ds_name),
-                num_samples=min(50, len(vis["paths"])),
-                resize=args.resize,
-                imagesize=args.imagesize,
-                annotations=vis.get("ann"),
-                diff_mode="sym",
-                diff_eps=float(args.diff_eps),
-            )
+        if genacc_logs:
+            LOGGER.info("Per-dataset gen_acc(gt_ai): %s", {k: round(v, 6) for k, v in genacc_logs.items()})
+    except Exception:
+        pass
+
+    try:
+        if all_labels:
+            labels_np = np.array(all_labels, dtype=int)
+            preds_np = np.array(all_preds, dtype=int)
+            overall_acc = float((labels_np == preds_np).mean())
+            LOGGER.info("Overall accuracy: %.4f (samples=%d)", overall_acc, len(labels_np))
+            for cls in [0, 1]:
+                tp = ((preds_np == cls) & (labels_np == cls)).sum()
+                fp = ((preds_np == cls) & (labels_np != cls)).sum()
+                fn = ((preds_np != cls) & (labels_np == cls)).sum()
+                prec = tp / (tp + fp + 1e-9)
+                rec = tp / (tp + fn + 1e-9)
+                f1 = 2 * prec * rec / (prec + rec + 1e-9)
+                LOGGER.info("Class %d: precision=%.4f recall=%.4f f1=%.4f", cls, prec, rec, f1)
     except Exception as e:
-        LOGGER.warning("Segmentation visualization skipped: %s", e)
+        LOGGER.warning("Failed to compute overall metrics: %s", e)
+
+    # overall generator accuracy
+    try:
+        if all_gen_gt and all_gen_pred and all_gen_is_ai:
+            gg = np.asarray(all_gen_gt, dtype=object)
+            ga = np.asarray(all_gen_pred, dtype=object)
+            is_ai = np.asarray(all_gen_is_ai, dtype=int) == 1
+            is_tp_ai = np.asarray(all_gen_is_tp_ai, dtype=int) == 1
+            n_ai = int(is_ai.sum())
+            n_tp_ai = int(is_tp_ai.sum())
+            gen_acc_ai = float((ga[is_ai] == gg[is_ai]).mean()) if n_ai else float("nan")
+            gen_acc_tp = float((ga[is_tp_ai] == gg[is_tp_ai]).mean()) if n_tp_ai else float("nan")
+            LOGGER.info("Overall gen_acc(gt_ai)=%.4f (n=%d) | gen_acc(tp_ai)=%.4f (n=%d)", gen_acc_ai, n_ai, gen_acc_tp, n_tp_ai)
+    except Exception as e:
+        LOGGER.warning("Failed to compute overall generator accuracy: %s", e)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    HOME = os.path.expanduser("~/dreamycore")
+    HOME = os.path.expanduser("~/wat")
     # 数据
     parser.add_argument("--data_path", type=str, default=os.path.expanduser("~/datasets/tiny_genimage"))
     parser.add_argument("--dataset_names", nargs="+", default=[
         # 'adm',
         # 'biggan', 
-        # 'glide', 
-        # 'midjourney', 
+        'glide', 
+        'midjourney', 
         'sdv5', 
         # 'vqdm', 
         # 'wukong',
         # 'Chameleon',
         # 'sdv5_bigval',
         # 'sdv5 mini', 
-    ], help="用于训练 PatchCore 记忆库和逻辑回归分类器的数据集名称列表（train split）。")
+    ], help="用于训练 WAT 记忆库和逻辑回归分类器的数据集名称列表（train split）。")
     parser.add_argument(
         "--test_dataset_names",
         nargs="+",
@@ -774,8 +616,8 @@ if __name__ == "__main__":
         default=[
         # 'adm',
         # 'biggan', 
-        # 'glide', 
-        # 'midjourney', 
+        'glide', 
+        'midjourney', 
         'sdv5', 
         # 'vqdm', 
         # 'wukong',
@@ -820,47 +662,22 @@ if __name__ == "__main__":
     parser.add_argument("--pretrain_embed_dimension", type=int, default=0,
                         help="预处理输出维度；设为 0 时按选定层的通道数自动推断")
     parser.add_argument("--target_embed_dimension", type=int, default=512)
-    parser.add_argument("--patchsize", type=int, default=3)
+    parser.add_argument("--patchsize", type=int, default=3, help="兼容参数（当前图像级聚合，不切 patch）")
     parser.add_argument("--anomaly_scorer_k", type=int, default=20)
 
-    # 逻辑回归分类器 / 阶段控制相关：
-    #   - phase = train ：在公共 train 上（按比例采样）训练 PatchCore 记忆库 + 逻辑回归，并保存到磁盘；
-    #   - phase = infer ：从磁盘加载已训练好的 PatchCore 记忆库与逻辑回归，只在 test 上做推理/评估；
-    #   - phase = both  ：先执行 train 流程，再在同一次运行中立即执行 infer 流程（默认行为）。
+    # 阶段控制与模型保存
     parser.add_argument(
         "--phase",type=str,choices=["train", "infer", "both"],
         default="both",
-        help=("运行阶段：'train' 仅训练 PatchCore 记忆库和逻辑回归；"
-            "'infer' 仅加载已训练模型并在 test 上推理/评估；"
+        help=("运行阶段：'train' 仅训练并保存 WAT 记忆库；"
+            "'infer' 仅加载已训练记忆库并在 test 上推理/评估；"
             "'both' 先训练再在同一次运行中执行推理/评估（默认）。"))
-    parser.add_argument(
-        "--classifier_path",type=str,
-        default=os.path.join( HOME, "classifier", "logreg_classifier.joblib"),
-        help="保存 / 加载逻辑回归分类器的路径。",
-    )
     parser.add_argument(
         "--pc_save_root",type=str,
         default=os.path.join( HOME, "memorybanks"),
-        help="保存 / 加载 PatchCore 记忆库的根目录，每个 bank 将保存在该目录下以 bank 名称命名的子目录中。",
-    )
-    parser.add_argument(
-        "--cls_train_fraction",type=float,default=0.1,
-        help="用于训练逻辑回归分类器的训练集采样比例 (0,1]，例如 0.1 表示随机采样 10% 的 train 样本。",
+        help="保存 / 加载 WAT 记忆库的根目录，每个 bank 将保存在该目录下以 bank 名称命名的子目录中。",
     )
 
-    # score diff 可视化
-    parser.add_argument("--diff_eps", type=float, default=1e-6, help="相对差分计算的 eps（防止除零）。")
-    parser.add_argument(
-        "--diff_outdir",
-        type=str,
-        default=os.path.join(HOME, "runs", "diff_viz"),
-        help="保存 score scatter / diff 直方图的目录。",
-    )
-    parser.add_argument(
-        "--no_diff_plots",
-        action="store_true",
-        help="关闭 (score_ai, score_nature) 的相对差分可视化图保存。",
-    )
 
     # sampler / coreset
     parser.add_argument("--sampler_name", 

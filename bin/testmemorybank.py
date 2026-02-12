@@ -1,11 +1,11 @@
 """
-Extract PatchCore memorybank features (before sampling) and visualize with UMAP.
+Extract WAT memorybank features (before sampling) and visualize with UMAP.
 
 What it does:
 1) For each bank (e.g. ai/nature), iterate TRAIN split and extract features:
-   - `--viz_feature_source=patchcore`: patch embeddings via `PatchCore._embed` (memorybank features BEFORE sampling).
-   - `--viz_feature_source=backbone`: raw backbone features from `feature_aggregator` (no PatchCore preprocessing/aggregation).
-2) (Optional) Apply PatchCore `RandomSampler` (same coreset sampler used in training).
+   - `--viz_feature_source=wat`: patch embeddings via `WAT._embed` (memorybank features BEFORE sampling).
+   - `--viz_feature_source=backbone`: raw backbone features from `feature_aggregator` (no WAT preprocessing/aggregation).
+2) (Optional) Apply WAT `RandomSampler` (same coreset sampler used in training).
 3) Randomly subsample points (UMAP is expensive on huge patch sets).
 4) Standardize features and run UMAP -> 2D.
 5) Save `umap_memorybank.png` (and optionally `.npz` artifacts).
@@ -19,11 +19,11 @@ from typing import List, Tuple
 import numpy as np
 import torch
 
-import patchcore.backbones
-import patchcore.common
-import patchcore.patchcore
-import patchcore.sampler
-from patchcore.datasets.tiny_genimage import Dataset, DatasetSplit
+import wat.backbones
+import wat.common
+import wat.wat
+import wat.sampler
+from wat.datasets.tiny_genimage import Dataset, DatasetSplit
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -45,7 +45,7 @@ def infer_input_shape(dl) -> Tuple[int, int, int]:
 
 @torch.no_grad()
 def extract_memorybank_features_before_sampling(
-    pc: patchcore.patchcore.PatchCore, train_loader: torch.utils.data.DataLoader
+    pc: wat.wat.WAT, train_loader: torch.utils.data.DataLoader
 ) -> np.ndarray:
     """
     Iterate the train loader and collect patch embeddings:
@@ -72,7 +72,7 @@ def extract_memorybank_features_before_sampling(
 
 @torch.no_grad()
 def extract_backbone_features_raw(
-    pc: patchcore.patchcore.PatchCore,
+    pc: wat.wat.WAT,
     train_loader: torch.utils.data.DataLoader,
     *,
     layer: str,
@@ -210,9 +210,9 @@ def main(args: argparse.Namespace) -> None:
         )
 
         input_shape = infer_input_shape(train_loader)
-        backbone = patchcore.backbones.load(args.backbone_name)
+        backbone = wat.backbones.load(args.backbone_name)
         backbone.name = args.backbone_name
-        pc = patchcore.patchcore.PatchCore(device)
+        pc = wat.wat.WAT(device)
         if args.viz_feature_source == "backbone":
             # IMPORTANT:
             # `feature_aggregator` only returns features for layers registered in `layers_to_extract_from`.
@@ -230,13 +230,13 @@ def main(args: argparse.Namespace) -> None:
             patchsize=args.patchsize,
             anomaly_score_num_nn=args.anomaly_scorer_k,
             # IMPORTANT: we want the "before sampling" features, so sampler doesn't matter for extraction.
-            featuresampler=patchcore.sampler.IdentitySampler(),
-            nn_method=patchcore.common.FaissNN(on_gpu=False, num_workers=4),
+            featuresampler=wat.sampler.IdentitySampler(),
+            nn_method=wat.common.FaissNN(on_gpu=False, num_workers=4),
         )
 
-        if args.viz_feature_source == "patchcore":
+        if args.viz_feature_source == "wat":
             feats = extract_memorybank_features_before_sampling(pc, train_loader)
-            LOGGER.info("[%s] patchcore memory features (before sampling): %s", bank, feats.shape)
+            LOGGER.info("[%s] wat memory features (before sampling): %s", bank, feats.shape)
         elif args.viz_feature_source == "backbone":
             layer = layers_to_extract_from[0]
             feats = extract_backbone_features_raw(
@@ -250,14 +250,14 @@ def main(args: argparse.Namespace) -> None:
         else:
             raise ValueError(f"Unknown --viz_feature_source={args.viz_feature_source!r}")
 
-        # Optional: apply PatchCore's RandomSampler BEFORE visualization.
-        # This is the same RandomSampler used in `bin/run_patchcore.py` memorybank building.
+        # Optional: apply WAT's RandomSampler BEFORE visualization.
+        # This is the same RandomSampler used in `bin/run_wat.py` memorybank building.
         feats_for_viz = feats
         if args.bank_sampler == "random":
             if not (0.0 < float(args.bank_sampler_percentage) < 1.0):
                 raise ValueError("--bank_sampler_percentage must be in (0,1) for RandomSampler.")
             np.random.seed(int(args.seed + bank_idx))  # RandomSampler uses np.random.choice internally
-            sampler = patchcore.sampler.RandomSampler(float(args.bank_sampler_percentage))
+            sampler = wat.sampler.RandomSampler(float(args.bank_sampler_percentage))
             feats_for_viz = np.asarray(sampler.run(feats_for_viz))
             LOGGER.info("[%s] after RandomSampler(p=%.3f): %s", bank, args.bank_sampler_percentage, feats_for_viz.shape)
 
@@ -349,8 +349,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--viz_feature_source",
         type=str,
-        default="patchcore",
-        choices=["patchcore", "backbone"],
+        default="wat",
+        choices=["wat", "backbone"],
         help="Which features to visualize: PatchCore patch embeddings, or raw backbone features.",
     )
     parser.add_argument(

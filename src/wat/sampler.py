@@ -10,6 +10,7 @@ class IdentitySampler:
     def run(
         self, features: Union[torch.Tensor, np.ndarray]
     ) -> Union[torch.Tensor, np.ndarray]:
+        self.last_indices = slice(None)  # 记录未采样
         return features
 
 
@@ -24,6 +25,7 @@ class BaseSampler(abc.ABC):
         if not 0 < percentage < 1:
             raise ValueError("Percentage value not in (0, 1).")
         self.percentage = percentage
+        self.last_indices = None
 
     @abc.abstractmethod
     def run(
@@ -119,12 +121,14 @@ class GreedyCoresetSampler(BaseSampler):
             采样后的特征
         """
         if self.percentage == 1:
+            self.last_indices = slice(None)
             return features
         self._store_type(features)  # 存储特征的数据类型
         if isinstance(features, np.ndarray):
             features = torch.from_numpy(features)
         reduced_features = self._reduce_features(features)  # 降维处理
         sample_indices = self._compute_greedy_coreset_indices(reduced_features)  # 获取贪心采样的索引
+        self.last_indices = sample_indices
         features = features[sample_indices]  # 根据索引选择样本
         return self._restore_type(features)  # 恢复特征的数据类型
 
@@ -269,6 +273,7 @@ class RandomSampler(BaseSampler):
         num_random_samples = int(n_before * self.percentage)
         subset_indices = np.random.choice(n_before, num_random_samples, replace=False)
         subset_indices = np.array(subset_indices)
+        self.last_indices = subset_indices
 
         # 选择子集
         subset = features[subset_indices]
@@ -325,6 +330,7 @@ class CentralSampler(BaseSampler):
             pbar.update()
 
             idx = np.argsort(dist)[:k]
+            self.last_indices = idx
             subset = features[idx]
             pbar.update()
 
@@ -375,6 +381,7 @@ class DensitySampler(BaseSampler):
 
             pbar.update()
             idx_sorted = np.argsort(mean_dist)[:k_pick]
+            self.last_indices = idx_sorted
             subset = features[idx_sorted]
             pbar.update()
 

@@ -1,6 +1,6 @@
 import timm  # noqa
 import torchvision.models as models  # noqa
-import pretrainedmodels
+# import pretrainedmodels
 
 # 推荐安装 open_clip_torch 用于 CLIP 骨干网络
 import open_clip
@@ -59,8 +59,8 @@ _CLIP_BACKBONES = {
     # 使用 open_clip 对应的名称，视觉骨干为 ViT-B/16 与 ViT-B/32
     # 仅返回 .visual 分支，方便与现有 CNN / ViT 一致地抽特征
     # 这里使用 open_clip 官方在 LAION-2B 数据集上训练的权重标签
-    "clip_vit_b16": ("ViT-B-16", "./models/open_clip/open_clip_pytorch_model.bin"),
-    "clip_vit_b32": ("ViT-B-32", "./models/open_clip/open_clip_pytorch_model.bin"),
+    "clip_vit_b16": ("ViT-B-16", "openai"),
+    "clip_vit_b32": ("ViT-B-32", "openai"),
 }
 
 

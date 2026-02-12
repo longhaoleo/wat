@@ -19,11 +19,11 @@ from typing import List, Tuple
 import numpy as np
 import torch
 
-import patchcore.backbones
-import patchcore.common
-import patchcore.patchcore
-import patchcore.sampler
-from patchcore.datasets.tiny_genimage import Dataset, DatasetSplit
+import wat.backbones
+import wat.common
+import wat.wat
+import wat.sampler
+from wat.datasets.tiny_genimage import Dataset, DatasetSplit
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -45,7 +45,7 @@ def infer_input_shape(dl) -> Tuple[int, int, int]:
 
 @torch.no_grad()
 def extract_memorybank_features_before_sampling(
-    pc: patchcore.patchcore.PatchCore, train_loader: torch.utils.data.DataLoader
+    pc: wat.wat.WAT, train_loader: torch.utils.data.DataLoader
 ) -> np.ndarray:
     """
     Iterate the train loader and collect patch embeddings:
@@ -148,9 +148,9 @@ def main(args: argparse.Namespace) -> None:
         )
 
         input_shape = infer_input_shape(train_loader)
-        backbone = patchcore.backbones.load(args.backbone_name)
+        backbone = wat.backbones.load(args.backbone_name)
         backbone.name = args.backbone_name
-        pc = patchcore.patchcore.PatchCore(device)
+        pc = wat.wat.WAT(device)
         pc.load(
             backbone=backbone,
             layers_to_extract_from=args.layers_to_extract_from,
@@ -160,8 +160,8 @@ def main(args: argparse.Namespace) -> None:
             target_embed_dimension=args.target_embed_dimension,
             patchsize=args.patchsize,
             anomaly_score_num_nn=args.anomaly_scorer_k,
-            featuresampler=patchcore.sampler.IdentitySampler(),
-            nn_method=patchcore.common.FaissNN(on_gpu=False, num_workers=4),
+            featuresampler=wat.sampler.IdentitySampler(),
+            nn_method=wat.common.FaissNN(on_gpu=False, num_workers=4),
         )
 
         feats = extract_memorybank_features_before_sampling(pc, train_loader)
@@ -279,4 +279,3 @@ if __name__ == "__main__":
     parser.add_argument("--out_dir", type=str, default=os.path.join(HOME, "runs", "tsne_memorybank"))
 
     main(parser.parse_args())
-

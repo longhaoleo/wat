@@ -2,8 +2,8 @@ import numpy as np
 import torch.utils.data
 from torchvision import models
 
-import patchcore
-from patchcore import patchcore as patchcore_model
+import wat
+from wat import wat as wat_model
 
 
 def _dummy_features(number_of_examples, shape_of_examples):
@@ -40,11 +40,11 @@ def _dummy_image_random_dataloader(number_of_examples, image_shape):
     return torch.utils.data.DataLoader(images, batch_size=4)
 
 
-def _standard_patchcore(image_dimension):
-    patchcore_instance = patchcore_model.PatchCore(torch.device("cpu"))
+def _standard_wat(image_dimension):
+    wat_instance = wat_model.WAT(torch.device("cpu"))
     backbone = models.wide_resnet50_2(pretrained=False)
     backbone.name, backbone.seed = "wideresnet50", 0
-    patchcore_instance.load(
+    wat_instance.load(
         backbone=backbone,
         layers_to_extract_from=["layer2", "layer3"],
         device=torch.device("cpu"),
@@ -55,24 +55,24 @@ def _standard_patchcore(image_dimension):
         patchstride=1,
         spade_nn=2,
     )
-    return patchcore_instance
+    return wat_instance
 
 
-def _load_patchcore_from_path(load_path):
-    patchcore_instance = patchcore_model.PatchCore(torch.device("cpu"))
-    patchcore_instance.load_from_path(
+def _load_wat_from_path(load_path):
+    wat_instance = wat_model.WAT(torch.device("cpu"))
+    wat_instance.load_from_path(
         load_path=load_path,
         device=torch.device("cpu"),
-        prepend="temp_patchcore",
-        nn_method=patchcore.common.FaissNN(False, 4),
+        prepend="temp_wat",
+        nn_method=wat.common.FaissNN(False, 4),
     )
-    return patchcore_instance
+    return wat_instance
 
 
 def _approximate_greedycoreset_sampler_with_reduction(
     sampling_percentage, johnsonlindenstrauss_dim
 ):
-    return patchcore.sampler.ApproximateGreedyCoresetSampler(
+    return wat.sampler.ApproximateGreedyCoresetSampler(
         percentage=sampling_percentage,
         device=torch.device("cpu"),
         number_of_starting_points=10,
@@ -80,9 +80,9 @@ def _approximate_greedycoreset_sampler_with_reduction(
     )
 
 
-def test_dummy_patchcore():
+def test_dummy_wat():
     image_dimension = 112
-    model = _standard_patchcore(image_dimension)
+    model = _standard_wat(image_dimension)
     training_dataloader = _dummy_constant_dataloader(
         4, [3, image_dimension, image_dimension]
     )
@@ -97,10 +97,10 @@ def test_dummy_patchcore():
         assert np.all(mask.shape == (image_dimension, image_dimension))
 
 
-def test_patchcore_on_dataloader():
+def test_wat_on_dataloader():
     """Test PatchCore on dataloader and assure training scores are zero."""
     image_dimension = 112
-    model = _standard_patchcore(image_dimension)
+    model = _standard_wat(image_dimension)
 
     training_dataloader = _dummy_constant_dataloader(
         4, [3, image_dimension, image_dimension]
@@ -114,15 +114,15 @@ def test_patchcore_on_dataloader():
         assert np.all(mask_gt.shape == (image_dimension, image_dimension))
 
 
-def test_patchcore_load_and_saveing(tmpdir):
+def test_wat_load_and_saving(tmpdir):
     image_dimension = 112
-    model = _standard_patchcore(image_dimension)
+    model = _standard_wat(image_dimension)
 
     training_dataloader = _dummy_constant_dataloader(
         4, [3, image_dimension, image_dimension]
     )
     model.fit(training_dataloader)
-    model.save_to_path(tmpdir, "temp_patchcore")
+    model.save_to_path(tmpdir, "temp_wat")
 
     test_features = torch.Tensor(
         1.234 * np.ones([2, 3, image_dimension, image_dimension])
@@ -135,10 +135,10 @@ def test_patchcore_load_and_saveing(tmpdir):
         assert np.all(mask == other_mask)
 
 
-def test_patchcore_real_data():
+def test_wat_real_data():
     image_dimension = 112
     sampling_percentage = 0.1
-    model = _standard_patchcore(image_dimension)
+    model = _standard_wat(image_dimension)
     model.sampler = _approximate_greedycoreset_sampler_with_reduction(
         sampling_percentage=sampling_percentage,
         johnsonlindenstrauss_dim=64,

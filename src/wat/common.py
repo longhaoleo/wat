@@ -1,17 +1,20 @@
 import copy
 import os
 import pickle
-from typing import List
-from typing import Union
+from typing import Dict, List, Optional, Union
 
-import faiss
 import numpy as np
-import scipy.ndimage as ndimage
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
-from patchcore.sampler import BaseSampler
+from wat.sampler import BaseSampler
+
+try:
+    import faiss  # type: ignore
+    HAS_FAISS = True
+except Exception:
+    HAS_FAISS = False
 
 METRIC = "l2"
 
@@ -43,6 +46,7 @@ class PCASampler(BaseSampler):
 
     def run(self, features: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
         if self.percentage == 1:
+            self.last_indices = slice(None)
             return features
 
         self._store_type(features)
@@ -73,6 +77,7 @@ class PCASampler(BaseSampler):
             n_keep = max(1, int(N * self.percentage))
             n_keep = min(n_keep, N)
             idx_fallback = np.random.choice(N, size=n_keep, replace=False)
+            self.last_indices = idx_fallback
             if isinstance(features, torch.Tensor):
                 idx_t = torch.as_tensor(idx_fallback, dtype=torch.long, device=features.device)
                 subset = features.index_select(0, idx_t)
@@ -94,6 +99,7 @@ class PCASampler(BaseSampler):
         n_keep = max(1, int(N * self.percentage))
         n_keep = min(n_keep, N)
         idx = np.argsort(scores)[-n_keep:]
+        self.last_indices = idx
 
         # 根据索引从原始特征中取子集（保持类型/设备）
         if isinstance(features, torch.Tensor):
@@ -105,36 +111,90 @@ class PCASampler(BaseSampler):
         return self._restore_type(subset)
 
 
-#### 近邻匹配 (Faiss近邻搜索)
+#### 近邻匹配 (可选 Faiss / 默认 Brute)
+class BruteNN(object):
+    """
+    纯 numpy 版 KNN：无 faiss 依赖，小规模数据够用。
+    距离支持 L2 / 内积，默认 L2。
+    """
+    def __init__(self, metric: str = METRIC) -> None:
+        self.metric = metric
+        self.index_features: Optional[np.ndarray] = None
+
+    def fit(self, features: np.ndarray) -> None:
+        self.index_features = np.asarray(features, dtype=np.float32)
+
+    def reset_index(self):
+        self.index_features = None
+
+    def add(self, features: np.ndarray) -> None:
+        if features is None or len(features) == 0:
+            return
+        feats = np.asarray(features, dtype=np.float32)
+        if self.index_features is None:
+            self.index_features = feats
+        else:
+            self.index_features = np.concatenate([self.index_features, feats], axis=0)
+
+    def _pairwise(self, query, index):
+        if self.metric == "ip":
+            sims = query @ index.T
+            # 更高相似度更近，将其转为“距离”形式：-sim
+            dist = -sims
+        else:  # l2
+            q2 = (query ** 2).sum(axis=1, keepdims=True)
+            i2 = (index ** 2).sum(axis=1, keepdims=True).T
+            dist = q2 + i2 - 2.0 * query @ index.T
+        return dist
+
+    def run(
+        self,
+        n_nearest_neighbours: int,
+        query_features: np.ndarray,
+        index_features: np.ndarray = None,
+    ) -> Union[np.ndarray, np.ndarray, np.ndarray]:
+        index = np.asarray(index_features if index_features is not None else self.index_features, dtype=np.float32)
+        query = np.asarray(query_features, dtype=np.float32)
+        if index is None:
+            raise RuntimeError("Index features are empty, call fit() first.")
+
+        dists = self._pairwise(query, index)
+        n = min(n_nearest_neighbours, index.shape[0])
+        nn_indices = np.argpartition(dists, kth=n-1, axis=1)[:, :n]
+        # 重新按距离排序
+        gathered = np.take_along_axis(dists, nn_indices, axis=1)
+        order = np.argsort(gathered, axis=1)
+        nn_indices = np.take_along_axis(nn_indices, order, axis=1)
+        nn_dists = np.take_along_axis(dists, nn_indices, axis=1)
+        return nn_dists, nn_indices
+
+    def save(self, filename: str) -> None:
+        if self.index_features is None:
+            return
+        with open(filename, "wb") as f:
+            pickle.dump(self.index_features, f, pickle.HIGHEST_PROTOCOL)
+
+    def load(self, filename: str) -> None:
+        with open(filename, "rb") as f:
+            self.index_features = pickle.load(f)
+
+
 class FaissNN(object):
+    """
+    可选的 FAISS 加速 KNN。若环境未安装 faiss，初始化时会报错。
+    """
     def __init__(self, on_gpu: bool = False, num_workers: int = 4, metric: str = METRIC) -> None:
-        """
-        基于 FAISS 的最近邻搜索封装。
-        功能：
-            - 根据给定特征维度创建合适的 FAISS 索引（L2 或内积）；
-            - 负责在 CPU / GPU 之间移动索引；
-            - 对外提供统一的 fit / search 接口，供上层最近邻评分类使用。
-        参数:
-            on_gpu : bool, 默认 False
-                - True  时：在 GPU 上构建/搜索 FAISS 索引（需要 GPU 支持）；
-                - False 时：仅使用 CPU 版本。
-            num_workers : int, 默认 4
-                设置 FAISS 内部使用的线程数，用于加速相似度搜索。
-            metric : str, 默认 METRIC（通常为 "l2"）
-                距离度量方式：
-                    - "l2"：欧氏距离；
-                    - "ip"：Inner Product，内积（可用于余弦相似度等）。
-        """
-        # 设置 FAISS 使用的线程数（CPU 多线程加速）
+        if not HAS_FAISS:
+            raise RuntimeError("faiss not installed; use BruteNN instead.")
         faiss.omp_set_num_threads(num_workers)
         self.on_gpu = on_gpu
-        self.search_index = None   # 实际的 FAISS 索引对象
+        self.search_index = None
         self.metric = metric
 
     def _index_to_gpu(self, index):
         if self.on_gpu:
             return faiss.index_cpu_to_gpu(
-                faiss.StandardGpuResources(), 0, index, self._gpu_cloner_options()
+                faiss.StandardGpuResources(), 0, index
             )
         return index
 
@@ -143,134 +203,53 @@ class FaissNN(object):
             return faiss.index_gpu_to_cpu(index)
         return index
 
-
     def _create_index(self, dimension):
-        """
-        根据特征维度和度量方式，创建一个具体的 FAISS 索引实例，供后面的 fit / search 使用。
-        参数:
-            dimension : int
-                特征向量维度 D。
-        返回:
-            一个可用于 add / search 的 FAISS 索引实例：
-                - 若 metric == "ip"：使用内积索引 IndexFlatIP / GpuIndexFlatIP；
-                - 否则（默认 "l2"）：使用欧氏距离索引 IndexFlatL2 / GpuIndexFlatL2。
-        """
-        # 内积距离（可用于余弦相似度等）
         if self.metric == "ip":
             if self.on_gpu:
-                # GPU 版本的内积索引
-                return faiss.GpuIndexFlatIP(
-                    faiss.StandardGpuResources(), dimension, faiss.GpuIndexFlatConfig()
-                )
-            # CPU 版本的内积索引
+                return faiss.GpuIndexFlatIP(faiss.StandardGpuResources(), dimension, faiss.GpuIndexFlatConfig())
             return faiss.IndexFlatIP(dimension)
-
-        # L2 距离（欧氏距离）
         if self.on_gpu:
-            # GPU 版本的 L2 索引
-            return faiss.GpuIndexFlatL2(
-                faiss.StandardGpuResources(), dimension, faiss.GpuIndexFlatConfig()
-            )
-        # CPU 版本的 L2 索引
+            return faiss.GpuIndexFlatL2(faiss.StandardGpuResources(), dimension, faiss.GpuIndexFlatConfig())
         return faiss.IndexFlatL2(dimension)
 
-
     def fit(self, features: np.ndarray) -> None:
-        """
-        将特征添加到FAISS搜索索引中。
-        参数:
-            features: 形状为 NxD 的数组 (N为样本数，D为特征维度)
-        """
-        # 如果之前已经有一个索引，先清空它，避免旧数据残留
         if self.search_index:
             self.reset_index()
-
-        # 根据特征维度 D 创建一个合适的 FAISS 索引结构
         self.search_index = self._create_index(features.shape[-1])
-
-        #（如有需要）对索引做训练，例如 IVFPQ 这类近似索引需要先 train
-        self._train(self.search_index, features)
-
-        # 把所有特征加入到索引里，作为“数据库向量”
-        self.search_index.add(features)
-
-    def _train(self, _index, _features):
-        """训练索引（此处不需要额外训练）"""
-        pass
+        self.search_index.add(features.astype(np.float32))
 
     def run(
         self,
         n_nearest_neighbours,
         query_features: np.ndarray,
         index_features: np.ndarray = None,
-    ) -> Union[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        返回最近邻搜索的距离和索引。
-        参数:
-            n_nearest_neighbours: int
-                每个查询要返回多少个最近邻（K）。
-            query_features: np.ndarray
-                查询特征，形状 [N_query, D]。
-            index_features: np.ndarray, 可选
-                如果提供，则在“这批特征”上临时建索引并搜索；
-                如果不提供，则使用事先通过 fit() 建好的 self.search_index。
-        """
-        # 情况 1：使用之前 fit 好的全局索引 self.search_index
+    ):
         if index_features is None:
-            # 直接在已有索引上做搜索
-            # 返回 (distances, indices)，distances/indices 形状为 [N_query, K]
             return self.search_index.search(query_features, n_nearest_neighbours)
-
-        # 情况 2：用户传入一批新的 index_features，临时建一个索引，再在上面搜索
-        # 为这次搜索创建一个新的索引（维度 = index_features.shape[-1]）
         search_index = self._create_index(index_features.shape[-1])
-        # 如有需要（IVFPQ 等近似索引），先训练索引结构
-        self._train(search_index, index_features)
-        # 把 index_features 加入这个临时索引
-        search_index.add(index_features)
-        # 在这个临时索引上对 query_features 做 KNN 搜索
+        search_index.add(index_features.astype(np.float32))
         return search_index.search(query_features, n_nearest_neighbours)
 
-
     def save(self, filename: str) -> None:
-        """将FAISS索引保存到文件"""
+        if self.search_index is None:
+            return
         faiss.write_index(self._index_to_cpu(self.search_index), filename)
 
     def load(self, filename: str) -> None:
-        """从文件加载FAISS索引"""
         self.search_index = self._index_to_gpu(faiss.read_index(filename))
 
     def reset_index(self):
-        """重置FAISS索引"""
         if self.search_index:
             self.search_index.reset()
             self.search_index = None
 
-
-class ApproximateFaissNN(FaissNN):
-    def _train(self, index, features):
-        """训练近似FAISS索引"""
-        index.train(features)
-
-    def _gpu_cloner_options(self):
-        """使用float16减少GPU内存消耗"""
-        cloner = faiss.GpuClonerOptions()
-        cloner.useFloat16 = True
-        return cloner
-
-    def _create_index(self, dimension):
-        """创建近似FAISS索引 (IVFPQ) 以加速搜索"""
-        quantizer = faiss.IndexFlatIP(dimension) if self.metric == "ip" else faiss.IndexFlatL2(dimension)
-        metric_type = faiss.METRIC_INNER_PRODUCT if self.metric == "ip" else faiss.METRIC_L2
-        index = faiss.IndexIVFPQ(
-            quantizer,
-            dimension,
-            512,  # 中心点数量
-            64,   # 子量化器数量
-            8,    # 每个代码的比特数
-            metric_type,
-        ) 
-        return self._index_to_gpu(index)
+    def add(self, features: np.ndarray) -> None:
+        if features is None or len(features) == 0:
+            return
+        if self.search_index is None:
+            self.fit(features)
+            return
+        self.search_index.add(features.astype(np.float32))
 
 
 class _BaseMerger:
@@ -543,53 +522,6 @@ class Aggregator(torch.nn.Module):
         return features.reshape(len(features), -1)
 
 
-class RescaleSegmentor:
-    def __init__(self, device, target_size=224):
-        """用于把 patch 级别的分数图，缩放/平滑到最终图像尺寸的分割器。"""
-        self.device = device
-        # 输出图像的目标边长（假设是方形图像，224x224）
-        self.target_size = target_size
-        # 高斯平滑的标准差，用于让热力图更平滑
-        self.smoothing = 4
-
-    def convert_to_segmentation(self, patch_scores):
-        """
-        将 patch 级分数图转换为最终的像素级分割图（热力图）。
-
-        输入:
-            patch_scores:
-                - 形状通常为 [B, H_p, W_p]，B 为 batch 大小，
-                  H_p/W_p 为 patch 网格的高宽（例如 28x28）。
-                - 可以是 numpy.ndarray 或 torch.Tensor。
-        流程:
-            1. 若输入是 numpy，则先转成 torch.Tensor；
-            2. 搬到指定 device，并在通道维上 unsqueeze 成 [B, 1, H_p, W_p]；
-            3. 使用双线性插值，将 (H_p, W_p) 上采样到目标大小 (target_size, target_size)；
-            4. 去掉通道维，转回 numpy 数组；
-            5. 对每张图做一次高斯滤波，使热力图更平滑。
-        """
-        with torch.no_grad():
-            # 1) numpy -> torch（如有必要）
-            if isinstance(patch_scores, np.ndarray):
-                patch_scores = torch.from_numpy(patch_scores)
-            # 2) 搬到 device，添加通道维 -> [B, 1, H_p, W_p]
-            _scores = patch_scores.to(self.device)
-            _scores = _scores.unsqueeze(1)
-            # 3) 双线性插值到目标尺寸 [B, 1, target_size, target_size]
-            _scores = F.interpolate(
-                _scores, size=self.target_size, mode="bilinear", align_corners=False
-            )
-            # 4) 去掉通道维，搬回 CPU，转回 numpy -> [B, target_size, target_size]
-            _scores = _scores.squeeze(1)
-            patch_scores = _scores.cpu().numpy()
-
-        # 5) 对每张分数图做高斯平滑，得到最终的 segmentation mask / 热力图
-        return [
-            ndimage.gaussian_filter(patch_score, sigma=self.smoothing)
-            for patch_score in patch_scores
-        ]
-
-
 class NetworkFeatureAggregator(torch.nn.Module):
     """高效的网络特征提取"""
 
@@ -710,18 +642,35 @@ class LastLayerToExtractReachedException(Exception):
 
 
 class NearestNeighbourScorer(object):
-    def __init__(self, n_nearest_neighbours: int, nn_method=FaissNN(False, 4)) -> None:
+    def __init__(
+        self,
+        n_nearest_neighbours: int,
+        nn_method=None,
+        *,
+        label_count_power: float = 0.5,
+        weight_eps: float = 1e-12,
+        diversity_alpha_entropy: float = 0.6,
+        diversity_alpha_unique: float = 0.4,
+    ) -> None:
         """
         最近邻异常评分类，用于计算图像或像素的异常分数
 
         参数:
             n_nearest_neighbours: 最近邻的数量，用于判断异常像素
-            nn_method: 使用的最近邻搜索方法（如FaissNN）
+            nn_method: 使用的最近邻搜索方法（如 FaissNN 或 BruteNN）
         """
         self.feature_merger = ConcatMerger()  # 用于合并特征的合并器
 
         self.n_nearest_neighbours = n_nearest_neighbours
-        self.nn_method = nn_method
+        self.nn_method = nn_method or BruteNN(METRIC)
+        self.label_count_power = float(label_count_power)
+        self.weight_eps = float(weight_eps)
+        # TopK 内标签越“杂”，置信度越低；这里把惩罚作用在 conf 上（不改变 argmax label）。
+        self.diversity_alpha_entropy = float(diversity_alpha_entropy)
+        self.diversity_alpha_unique = float(diversity_alpha_unique)
+
+        # 与 detection_features 行对齐的数据集标签
+        self.detection_dataset_labels: Optional[np.ndarray] = None
 
         # 图像级别的最近邻搜索函数
         self.imagelevel_nn = lambda query: self.nn_method.run(
@@ -730,23 +679,34 @@ class NearestNeighbourScorer(object):
         # 像素级别的最近邻搜索函数
         self.pixelwise_nn = lambda query, index: self.nn_method.run(1, query, index)
 
-    def fit(self, detection_features: List[np.ndarray]) -> None:
+    def fit(
+        self,
+        detection_features: List[np.ndarray],
+        detection_labels: Optional[np.ndarray] = None,
+    ) -> None:
         """
         调用最近邻方法的fit函数进行训练
 
         参数:
             detection_features: 训练图像的特征列表，每个特征对应于某个图像的特征向量
+            detection_labels: 可选，每个特征行对应的数据集名称
         """
         self.detection_features = self.feature_merger.merge(
             detection_features,  # 合并所有训练图像的特征，分层 N ，每层将特征压成一维
         )
         self.detection_features = _l2_normalize_np(self.detection_features)
+        if detection_labels is None:
+            detection_labels = np.array(["unknown"] * len(self.detection_features))
+        detection_labels = np.asarray(detection_labels).reshape(-1)
+        if detection_labels.shape[0] != self.detection_features.shape[0]:
+            raise ValueError("detection_labels length must match detection_features rows.")
+        self.detection_dataset_labels = detection_labels
         self.nn_method.fit(self.detection_features)  # 用合并后的特征训练最近邻模型，一维向量
 
 
     def predict(
         self, query_features: List[np.ndarray]
-    ) -> Union[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Union[np.ndarray, np.ndarray, np.ndarray, List[str], List[float], List[int], List[int]]:
         """
         预测异常分数
         参数:
@@ -766,7 +726,93 @@ class NearestNeighbourScorer(object):
             sims = 1.0 - (query_distances / 2.0)  # L2(单位向量) -> cos
         sims = np.clip(sims, -1.0, 1.0)
         anomaly_scores = (1.0 - sims.mean(axis=-1)) / 2.0  # 相似度高 -> 异常低
-        return anomaly_scores, query_distances, query_nns
+
+        pred_labels: List[str] = []
+        pred_label_confs: List[float] = []
+        pred_label_counts: List[int] = []
+        pred_label_unique: List[int] = []
+        if self.detection_dataset_labels is not None:
+            for row_idx, nn_row in enumerate(query_nns):
+                labels = self.detection_dataset_labels[nn_row]
+                dists = query_distances[row_idx]
+                best_label, conf, best_count, n_unique = self._vote_label(labels=labels, dists=dists)
+                pred_labels.append(best_label)
+                pred_label_confs.append(conf)
+                pred_label_counts.append(best_count)
+                pred_label_unique.append(n_unique)
+
+        return anomaly_scores, query_distances, query_nns, pred_labels, pred_label_confs, pred_label_counts, pred_label_unique
+
+    def _vote_label(self, *, labels: np.ndarray, dists: np.ndarray) -> tuple[str, float, int, int]:
+        """
+        TopK label 投票（距离权重 + 数量加成）并返回惩罚后的置信度。
+        返回: (best_label, conf, best_count, n_unique)
+        """
+        weights = self._weights_from_dists(dists)
+
+        weight_sum_by_label: Dict[str, float] = {}
+        count_by_label: Dict[str, int] = {}
+        for lab, w in zip(labels, weights):
+            k = str(lab)
+            weight_sum_by_label[k] = weight_sum_by_label.get(k, 0.0) + float(w)
+            count_by_label[k] = count_by_label.get(k, 0) + 1
+
+        if not weight_sum_by_label:
+            return "unknown", float("nan"), 0, 0
+
+        scored = {
+            k: weight_sum_by_label[k] * (count_by_label[k] ** self.label_count_power)
+            for k in weight_sum_by_label.keys()
+        }
+        best_label = max(scored, key=scored.get)
+        best_score = float(scored[best_label])
+        denom = float(sum(scored.values())) + self.weight_eps
+        base_conf = best_score / denom
+
+        penalty, _, _ = self._diversity_penalty(scored=scored, k=len(dists))
+        conf = float(np.clip(base_conf * penalty, 0.0, 1.0))
+        return best_label, conf, int(count_by_label.get(best_label, 0)), int(len(count_by_label))
+
+    def _weights_from_dists(self, dists: np.ndarray) -> np.ndarray:
+        # 距离越小权重越大；ip 用 softmax（更稳定），l2 用倒数权重
+        if METRIC == "ip":
+            x = dists.astype(np.float64)
+            x = x - np.max(x)
+            return np.exp(x)
+        return 1.0 / (dists.astype(np.float64) + self.weight_eps)
+
+    def _diversity_penalty(self, *, scored: Dict[str, float], k: int) -> tuple[float, float, float]:
+        """
+        计算“杂乱度”惩罚因子（用于降低最近邻标签置信度）：
+          - entropy：score 分布越均匀，越杂
+          - unique_ratio：TopK 里不同 label 越多，越杂
+
+        返回:
+          (penalty, entropy_norm, unique_ratio)
+        """
+        n_unique = len(scored)
+        if n_unique <= 1:
+            return 1.0, 0.0, 0.0
+
+        values = np.asarray(list(scored.values()), dtype=np.float64)
+        total = float(values.sum())
+        if not np.isfinite(total) or total <= self.weight_eps:
+            # 极端数值场景：不做惩罚，避免把 conf 直接压没
+            return 1.0, 0.0, 0.0
+
+        p = values / (total + self.weight_eps)
+        ent = -float(np.sum(p * np.log(p + self.weight_eps)))
+        ent_max = float(np.log(n_unique + self.weight_eps))
+        entropy_norm = 0.0 if ent_max <= 0.0 else float(np.clip(ent / ent_max, 0.0, 1.0))
+
+        # 归一化 unique_ratio：n_unique=1 -> 0，n_unique=k -> 1
+        unique_ratio = float(np.clip((n_unique - 1) / float(max(1, k - 1)), 0.0, 1.0))
+
+        # 惩罚乘法组合：两者任何一个很“杂”都会降低 penalty
+        p_ent = 1.0 - self.diversity_alpha_entropy * entropy_norm
+        p_uni = 1.0 - self.diversity_alpha_unique * unique_ratio
+        penalty = float(np.clip(p_ent, 0.0, 1.0) * np.clip(p_uni, 0.0, 1.0))
+        return penalty, entropy_norm, unique_ratio
 
     @staticmethod
     def _detection_file(folder, prepend=""):
@@ -834,6 +880,11 @@ class NearestNeighbourScorer(object):
             self._save(
                 self._detection_file(save_folder, prepend), self.detection_features
             )
+        if self.detection_dataset_labels is not None:
+            self._save(
+                os.path.join(save_folder, prepend + "nnscorer_labels.pkl"),
+                self.detection_dataset_labels,
+            )
 
     def save_and_reset(self, save_folder: str) -> None:
         """保存并重置最近邻索引"""
@@ -846,4 +897,40 @@ class NearestNeighbourScorer(object):
         if os.path.exists(self._detection_file(load_folder, prepend)):
             self.detection_features = self._load(
                 self._detection_file(load_folder, prepend)
+            )
+        labels_path = os.path.join(load_folder, prepend + "nnscorer_labels.pkl")
+        if os.path.exists(labels_path):
+            self.detection_dataset_labels = self._load(labels_path)
+        else:
+            self.detection_dataset_labels = None
+
+    def add_features(
+        self, new_features: np.ndarray, new_labels: Optional[np.ndarray] = None
+    ) -> None:
+        """
+        向现有索引追加新特征，并保存对应数据集标签。
+        """
+        if new_features is None or len(new_features) == 0:
+            return
+        new_features = _l2_normalize_np(new_features)
+        self.nn_method.add(new_features)
+        if getattr(self, "detection_features", None) is None:
+            self.detection_features = new_features
+        else:
+            self.detection_features = np.concatenate(
+                [self.detection_features, new_features], axis=0
+            )
+
+        if new_labels is None:
+            new_labels = np.array(["unknown"] * len(new_features))
+        else:
+            new_labels = np.asarray(new_labels).reshape(-1)
+            if len(new_labels) != len(new_features):
+                raise ValueError("new_labels length must match new_features rows.")
+
+        if self.detection_dataset_labels is None:
+            self.detection_dataset_labels = new_labels
+        else:
+            self.detection_dataset_labels = np.concatenate(
+                [self.detection_dataset_labels, new_labels], axis=0
             )

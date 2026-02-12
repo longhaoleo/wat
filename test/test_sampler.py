@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.utils.data
 
-from patchcore import sampler
+from wat import sampler
 
 
 def _dummy_features(feature_dimension):
