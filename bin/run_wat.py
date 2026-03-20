@@ -18,22 +18,24 @@ from wat.datasets.tiny_genimage import Dataset, DatasetSplit
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 LOGGER = logging.getLogger("run_wat")
 
-def roc_auc_binary(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """纯 numpy AUROC（避免硬依赖 sklearn）；y_true 必须是 {0,1}。"""
-    y_true = np.asarray(y_true).reshape(-1).astype(int)
-    y_score = np.asarray(y_score).reshape(-1).astype(float)
-    if y_true.size == 0:
-        return float("nan")
-    n_pos = int((y_true == 1).sum())
-    n_neg = int((y_true == 0).sum())
-    if n_pos == 0 or n_neg == 0:
-        return float("nan")
 
-    order = np.argsort(y_score)
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(1, len(y_score) + 1, dtype=np.float64)
-    sum_ranks_pos = float(ranks[y_true == 1].sum())
-    return (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+def fuse_ai_margin_with_conf(
+    raw_margin: np.ndarray,
+    ai_conf: np.ndarray,
+    conf_floor: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    将 AI 库 generator 置信度融合进二分类 margin。
+    - raw_margin = score_nature - score_ai，越大越偏向 AI；
+    - gate = conf_floor + (1-conf_floor) * clip(ai_conf, 0, 1)；
+    - adj_margin = raw_margin * gate。
+    """
+    conf = np.asarray(ai_conf, dtype=float).reshape(-1)
+    conf = np.where(np.isfinite(conf), conf, 0.0)
+    conf = np.clip(conf, 0.0, 1.0)
+    conf_floor = float(np.clip(conf_floor, 0.0, 1.0))
+    gate = conf_floor + (1.0 - conf_floor) * conf
+    return np.asarray(raw_margin, dtype=float).reshape(-1) * gate, gate
 
 
 # -----------------------------
@@ -349,7 +351,7 @@ def main(args):
     sampler = get_sampler(args.sampler_name, args.coreset_percentage, device)
 
     # -----------------------------
-    # Phase 1: 训练 WAT 记忆库 + 逻辑回归分类器，并保存到磁盘
+    # Phase 1: 训练 WAT 记忆库并保存到磁盘
     # -----------------------------
     if args.phase in ("train", "both"):
         # 1) 构建 WAT builder，用于后续为各 bank 训练记忆库
@@ -432,11 +434,16 @@ def main(args):
     )
     common_loaders = build_dataloader_test(seed=args.seed, bankname=None)
 
-    summary_logs: Dict[str, float] = {}
+    summary_allacc_logs: Dict[str, float] = {}
+    summary_certainacc_logs: Dict[str, float] = {}
+    summary_uncertain_logs: Dict[str, float] = {}
     genacc_logs: Dict[str, float] = {}
     csv_rows: List[List[Any]] = []
-    all_labels: List[int] = []
-    all_preds: List[int] = []
+    all_labels_total: List[int] = []
+    all_preds_total: List[int] = []
+    all_preds_certain: List[int] = []
+    all_labels_certain: List[int] = []
+    all_uncertain_flags: List[int] = []
     all_gen_gt: List[str] = []
     all_gen_pred: List[str] = []
     all_gen_is_ai: List[int] = []
@@ -465,22 +472,45 @@ def main(args):
         test_scores_b_np = np.asarray(test_scores_b, dtype=float).reshape(-1)
         y_test_np = np.asarray(y_test, dtype=int).reshape(-1)
 
-        preds = (test_scores_a_np < test_scores_b_np).astype(int)  # 更接近 ai bank 即判为 ai=1
-        acc = float((preds == y_test_np).mean()) if len(y_test_np) else 0.0
-        auc = roc_auc_binary(y_test_np, (test_scores_b_np - test_scores_a_np))
+        paths = [str(p) for p in test_path_a] if test_path_a is not None else ["-"] * len(test_scores_a_np)
+        gen_a = gen_pred_a or ["unknown"] * len(test_scores_a_np)
+        gen_a_conf = np.asarray(gen_conf_a or [float("nan")] * len(test_scores_a_np), dtype=float).reshape(-1)
+        nat_b = nat_pred_b or ["nature"] * len(test_scores_a_np)
+        gt_gen = gt_generators or ["unknown"] * len(test_scores_a_np)
+        gt_ds = gt_dataset_names or [ds_name] * len(test_scores_a_np)
 
-        summary_logs[ds_name] = acc
-        LOGGER.info("[%s] acc=%.4f, auc=%.4f", ds_name, acc, auc)
+        raw_margin = (test_scores_b_np - test_scores_a_np)  # >0 偏向 AI，<0 偏向 nature
+        adj_margin, conf_gate = fuse_ai_margin_with_conf(
+            raw_margin=raw_margin,
+            ai_conf=gen_a_conf,
+            conf_floor=args.ai_conf_floor,
+        )
+        uncertain_mask = np.abs(adj_margin) < float(args.uncertain_eps)
+        preds = np.where(uncertain_mask, -1, (adj_margin > 0.0).astype(int))  # -1: uncertain
+        certain_mask = preds != -1
 
-        all_labels.extend(y_test_np.tolist())
-        all_preds.extend(preds.tolist())
+        # all_acc: 全样本准确率；uncertain(-1) 会自然记为错误
+        all_acc = float((preds == y_test_np).mean()) if len(y_test_np) else float("nan")
+        if certain_mask.any():
+            acc_certain = float((preds[certain_mask] == y_test_np[certain_mask]).mean())
+        else:
+            acc_certain = float("nan")
+        coverage = float(certain_mask.mean()) if len(certain_mask) else 0.0
+        uncertain_rate = 1.0 - coverage
+        summary_allacc_logs[ds_name] = all_acc
+        summary_certainacc_logs[ds_name] = acc_certain
+        summary_uncertain_logs[ds_name] = uncertain_rate
+        LOGGER.info(
+            "[%s] acc_certain=%.4f, all_acc=%.4f, coverage=%.4f, uncertain_rate=%.4f",
+            ds_name, acc_certain, all_acc, coverage, uncertain_rate
+        )
 
-        paths = [str(p) for p in test_path_a] if test_path_a is not None else ["-"] * len(preds)
-        gen_a = gen_pred_a or ["unknown"] * len(preds)
-        gen_a_conf = gen_conf_a or [float("nan")] * len(preds)
-        nat_b = nat_pred_b or ["nature"] * len(preds)
-        gt_gen = gt_generators or ["unknown"] * len(preds)
-        gt_ds = gt_dataset_names or [ds_name] * len(preds)
+        all_labels_total.extend(y_test_np.tolist())
+        all_preds_total.extend(preds.astype(int).tolist())
+        all_uncertain_flags.extend(uncertain_mask.astype(int).tolist())
+        if certain_mask.any():
+            all_labels_certain.extend(y_test_np[certain_mask].tolist())
+            all_preds_certain.extend(preds[certain_mask].tolist())
 
         # generator accuracy：只在真实 AI 样本上统计（nature 没有 generator 语义）
         try:
@@ -508,13 +538,25 @@ def main(args):
         except Exception as e:
             LOGGER.warning("[%s] Failed to compute generator accuracy: %s", ds_name, e)
 
-        for path, sa, sb, yt, pr, ga, gc, nb, ggt, dgt in zip(
-            paths, test_scores_a_np, test_scores_b_np, y_test_np, preds, gen_a, gen_a_conf, nat_b, gt_gen, gt_ds
+        for path, sa, sb, yt, pr, ga, gc, nb, ggt, dgt, m_raw, m_adj, gate, un in zip(
+            paths, test_scores_a_np, test_scores_b_np, y_test_np, preds, gen_a, gen_a_conf, nat_b, gt_gen, gt_ds,
+            raw_margin, adj_margin, conf_gate, uncertain_mask
         ):
             rel = (sa - sb) / (abs(sb) + 1e-8)
             sym = (sa - sb) / (abs(sa) + abs(sb) + 1e-8)
-            pred_gen = ga if int(pr) == 1 else "nature"
-            csv_rows.append([ds_name, path, sa, sb, rel, sym, yt, pr, pred_gen, ga, gc, nb, ggt, dgt])
+            if int(pr) == 1:
+                pred_gen = ga
+                pred_label = "ai"
+            elif int(pr) == 0:
+                pred_gen = "nature"
+                pred_label = "nature"
+            else:
+                pred_gen = "uncertain"
+                pred_label = "uncertain"
+            csv_rows.append([
+                ds_name, path, sa, sb, rel, sym, yt, pr, pred_label, int(un),
+                float(m_raw), float(m_adj), float(gate), pred_gen, ga, gc, nb, ggt, dgt
+            ])
 
 
     # 保存每个测试样本的两个原始分数到 CSV（覆盖全部 test 样本）
@@ -533,6 +575,11 @@ def main(args):
                     "sym_diff",
                     "label_is_ai",
                     "pred_is_ai",
+                    "pred_label",
+                    "is_uncertain",
+                    "margin_raw",
+                    "margin_adj",
+                    "ai_conf_gate",
                     "pred_generator",
                     "ai_generator",
                     "ai_generator_conf",
@@ -548,8 +595,12 @@ def main(args):
 
     # 打印 summary 与全局精度
     try:
-        if summary_logs:
-            LOGGER.info("Per-dataset acc: %s", {k: round(v, 6) for k, v in summary_logs.items()})
+        if summary_certainacc_logs:
+            LOGGER.info("Per-dataset acc_certain: %s", {k: round(v, 6) for k, v in summary_certainacc_logs.items()})
+        if summary_allacc_logs:
+            LOGGER.info("Per-dataset all_acc: %s", {k: round(v, 6) for k, v in summary_allacc_logs.items()})
+        if summary_uncertain_logs:
+            LOGGER.info("Per-dataset uncertain_rate: %s", {k: round(v, 6) for k, v in summary_uncertain_logs.items()})
     except Exception:
         pass
 
@@ -560,19 +611,22 @@ def main(args):
         pass
 
     try:
-        if all_labels:
-            labels_np = np.array(all_labels, dtype=int)
-            preds_np = np.array(all_preds, dtype=int)
+        if all_labels_total:
+            total_samples = len(all_labels_total)
+            uncertain_rate = float(np.mean(np.asarray(all_uncertain_flags, dtype=int)))
+            coverage = 1.0 - uncertain_rate
+            LOGGER.info("Overall coverage=%.4f, uncertain_rate=%.4f (samples=%d)", coverage, uncertain_rate, total_samples)
+        if all_labels_total and all_preds_total:
+            labels_all_np = np.asarray(all_labels_total, dtype=int)
+            preds_all_np = np.asarray(all_preds_total, dtype=int)
+            overall_all_acc = float((labels_all_np == preds_all_np).mean())
+            LOGGER.info("Overall all_acc: %.4f (samples=%d)", overall_all_acc, len(labels_all_np))
+
+        if all_labels_certain:
+            labels_np = np.array(all_labels_certain, dtype=int)
+            preds_np = np.array(all_preds_certain, dtype=int)
             overall_acc = float((labels_np == preds_np).mean())
-            LOGGER.info("Overall accuracy: %.4f (samples=%d)", overall_acc, len(labels_np))
-            for cls in [0, 1]:
-                tp = ((preds_np == cls) & (labels_np == cls)).sum()
-                fp = ((preds_np == cls) & (labels_np != cls)).sum()
-                fn = ((preds_np != cls) & (labels_np == cls)).sum()
-                prec = tp / (tp + fp + 1e-9)
-                rec = tp / (tp + fn + 1e-9)
-                f1 = 2 * prec * rec / (prec + rec + 1e-9)
-                LOGGER.info("Class %d: precision=%.4f recall=%.4f f1=%.4f", cls, prec, rec, f1)
+            LOGGER.info("Overall acc_certain: %.4f (samples=%d)", overall_acc, len(labels_np))
     except Exception as e:
         LOGGER.warning("Failed to compute overall metrics: %s", e)
 
@@ -608,7 +662,7 @@ if __name__ == "__main__":
         # 'Chameleon',
         # 'sdv5_bigval',
         # 'sdv5 mini', 
-    ], help="用于训练 WAT 记忆库和逻辑回归分类器的数据集名称列表（train split）。")
+    ], help="用于训练 WAT 记忆库的数据集名称列表（train split）。")
     parser.add_argument(
         "--test_dataset_names",
         nargs="+",
@@ -668,7 +722,7 @@ if __name__ == "__main__":
     # 阶段控制与模型保存
     parser.add_argument(
         "--phase",type=str,choices=["train", "infer", "both"],
-        default="both",
+        default="infer",
         help=("运行阶段：'train' 仅训练并保存 WAT 记忆库；"
             "'infer' 仅加载已训练记忆库并在 test 上推理/评估；"
             "'both' 先训练再在同一次运行中执行推理/评估（默认）。"))
@@ -692,6 +746,18 @@ if __name__ == "__main__":
     parser.add_argument("--faiss_on_gpu", action="store_true")
     parser.add_argument("--faiss_num_workers", type=int, default=12)
     parser.add_argument("--nn_method", choices=["auto", "flat", "ivfpq"], default="auto")
+    parser.add_argument(
+        "--ai_conf_floor",
+        type=float,
+        default=0.35,
+        help="将 ai_generator_conf 融入分类 margin 时的最小保留权重（0~1，越小越依赖 conf）。",
+    )
+    parser.add_argument(
+        "--uncertain_eps",
+        type=float,
+        default=0.01,
+        help="不确定区间阈值：|adjusted_margin| < eps 时输出 uncertain。",
+    )
 
     # 两个 bank 名称
     parser.add_argument("--banknames", nargs="+", default=['ai','nature'],)

@@ -718,14 +718,10 @@ class NearestNeighbourScorer(object):
         query_features = _l2_normalize_np(query_features)
         query_distances, query_nns = self.imagelevel_nn(query_features)  # 查询最近邻
 
-        # 将距离转换为余弦相似度，再映射到 [0,1] 的异常得分
-        metric = METRIC
-        if metric == "ip":
-            sims = query_distances  # 内积即相似度
-        else:
-            sims = 1.0 - (query_distances / 2.0)  # L2(单位向量) -> cos
-        sims = np.clip(sims, -1.0, 1.0)
-        anomaly_scores = (1.0 - sims.mean(axis=-1)) / 2.0  # 相似度高 -> 异常低
+        # 仅使用 L2 距离：TopK 距离均值映射到 [0,1] 异常分数。
+        # 由于前面已做 L2 归一化，距离理论上在 [0, 2]，故除以 2 即可映射到 [0,1]。
+        mean_dists = query_distances.mean(axis=-1)
+        anomaly_scores = np.clip(mean_dists / 2.0, 0.0, 1.0)
 
         pred_labels: List[str] = []
         pred_label_confs: List[float] = []
@@ -774,11 +770,7 @@ class NearestNeighbourScorer(object):
         return best_label, conf, int(count_by_label.get(best_label, 0)), int(len(count_by_label))
 
     def _weights_from_dists(self, dists: np.ndarray) -> np.ndarray:
-        # 距离越小权重越大；ip 用 softmax（更稳定），l2 用倒数权重
-        if METRIC == "ip":
-            x = dists.astype(np.float64)
-            x = x - np.max(x)
-            return np.exp(x)
+        # 仅使用 L2 距离：距离越小，权重越大。
         return 1.0 / (dists.astype(np.float64) + self.weight_eps)
 
     def _diversity_penalty(self, *, scored: Dict[str, float], k: int) -> tuple[float, float, float]:

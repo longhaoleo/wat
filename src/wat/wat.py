@@ -148,7 +148,6 @@ class WAT(torch.nn.Module):
         auto_pre_dim = max(int(d) for d in feature_dimensions) if len(feature_dimensions) else target_embed_dimension
         pre_dim = int(pretrain_embed_dimension) if (pretrain_embed_dimension and pretrain_embed_dimension > 0) else auto_pre_dim
 
-        #TODO: 选择预处理层
         # 使用 patch 级 Gram 预处理
         # preprocessing = wat.common.PatchGramPreprocessing(output_dim=pre_dim)
         # 配置预处理层：将每层展平后自适应池化到 pre_dim，再堆叠供后续聚合

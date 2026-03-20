@@ -1,7 +1,6 @@
 # Bash语法：
 # 临时加入环境变量 
 export PYTHONPATH=$(pwd)/src:$PYTHONPATH
-mamba activate core
 python -m bin.run_wat
 
 

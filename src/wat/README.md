@@ -1,6 +1,6 @@
-## WAT 代码结构（精简版）
+## WAT 代码结构
 
-本仓库当前实现的是 **图像级 embedding + KNN** 的 WAT 流程（不做 PatchMaker / 分割可视化 / 逻辑回归分类器）。
+**图像级 embedding + KNN** 的 WAT 流程。
 
 ### 核心文件
 
