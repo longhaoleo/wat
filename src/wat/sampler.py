@@ -1,3 +1,15 @@
+"""
+特征采样器模块。
+
+对应 `PROJECT_DETAILED_COMMENTS.md` 第 5 节：
+- `IdentitySampler`: 不采样；
+- `GreedyCoresetSampler` / `ApproximateGreedyCoresetSampler`: 覆盖代表性；
+- `RandomSampler`: 随机子集；
+- `CentralSampler`: 保留中心主体；
+- `DensitySampler`: 保留高密度区域；
+- `KMeansSampler`: 每簇选代表点（支持 top-k）。
+"""
+
 import abc
 from typing import Union
 
@@ -7,6 +19,7 @@ import tqdm
 
 # 定义一个身份采样器，不进行任何处理，直接返回输入特征
 class IdentitySampler:
+    """恒等采样器：用于关闭采样逻辑，同时保持统一接口。"""
     def run(
         self, features: Union[torch.Tensor, np.ndarray]
     ) -> Union[torch.Tensor, np.ndarray]:
@@ -25,6 +38,7 @@ class BaseSampler(abc.ABC):
         if not 0 < percentage < 1:
             raise ValueError("Percentage value not in (0, 1).")
         self.percentage = percentage
+        # last_indices 用于上层同步裁剪标签（features 与 labels 对齐）。
         self.last_indices = None
 
     @abc.abstractmethod
@@ -101,6 +115,7 @@ class GreedyCoresetSampler(BaseSampler):
         """
         if features.shape[1] == self.dimension_to_project_features_to:
             return features
+        # 线性投影只用于采样距离计算，不改变最终返回特征的原始空间。
         mapper = torch.nn.Linear(
             features.shape[1], self.dimension_to_project_features_to, bias=False
         )
@@ -231,6 +246,7 @@ class ApproximateGreedyCoresetSampler(GreedyCoresetSampler):
         coreset_indices = []
         num_coreset_samples = int(len(features) * self.percentage)
 
+        # 近似版本核心：只维护“到已选集合的最小距离”，避免完整 NxN 更新。
         with torch.no_grad():
             for _ in tqdm.tqdm(range(num_coreset_samples), desc="Subsampling..."):
                 select_idx = torch.argmax(approximate_coreset_anchor_distances).item()
@@ -269,7 +285,7 @@ class RandomSampler(BaseSampler):
         n_before = len(features)
         shape_before = getattr(features, "shape", None)
 
-        # 随机采样索引
+        # 随机采样索引（无放回），并记录到 last_indices 供标签同步。
         num_random_samples = int(n_before * self.percentage)
         subset_indices = np.random.choice(n_before, num_random_samples, replace=False)
         subset_indices = np.array(subset_indices)
@@ -316,6 +332,7 @@ class CentralSampler(BaseSampler):
             k = max(1, int(N * self.percentage))
             pbar.update()
 
+            # 全局中心向量：用于衡量每个样本离“主体分布中心”的距离。
             mu = X.mean(axis=0, keepdims=True)
             if self.use_mahalanobis:
                 S = np.cov((X - mu).T) + self.epsilon * np.eye(X.shape[1])
@@ -374,6 +391,7 @@ class DensitySampler(BaseSampler):
                 dists, _ = nn.kneighbors(X, n_neighbors=k, return_distance=True)
                 mean_dist = dists[:, 1:].mean(axis=1) if dists.shape[1] >= 2 else dists[:, 0]
             except Exception as e:
+                # sklearn 不可用时显式提示并退化随机采样，保证流程不中断。
                 tqdm.tqdm.write(f"[DensitySampler] sklearn NearestNeighbors failed ({e}); falling back to Random.")
                 idx = np.random.choice(N, k_pick, replace=False)
                 pbar.close()

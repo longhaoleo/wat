@@ -9,6 +9,13 @@ What it does:
 3) Randomly subsample points (UMAP is expensive on huge patch sets).
 4) Standardize features and run UMAP -> 2D.
 5) Save `umap_memorybank.png` (and optionally `.npz` artifacts).
+
+`PROJECT_DETAILED_COMMENTS.md` 第 8 节已写入本文件：
+- `infer_input_shape(...)`：推断输入尺寸；
+- `extract_memorybank_features_before_sampling(...)`：提取采样前 memory bank 特征；
+- `extract_backbone_features_raw(...)`：直接可视化 backbone 原始层特征；
+- `run_umap(...)`：执行降维；
+- `main(...)`：串起读取、提取、采样、可视化与落盘。
 """
 
 import argparse
@@ -31,6 +38,7 @@ LOGGER = logging.getLogger("testmemorybank")
 
 
 def infer_input_shape(dl) -> Tuple[int, int, int]:
+    """从 dataloader 抽一批，推断模型输入 `(C,H,W)`。"""
     x = next(iter(dl))
     if isinstance(x, dict):
         x = x.get("image", next(iter(x.values())))
@@ -52,6 +60,7 @@ def extract_memorybank_features_before_sampling(
     - This is exactly the "memorybank features BEFORE sampling".
     - Output shape is roughly [N_patches_total, D] (very large).
     """
+    # 与建库阶段保持一致：eval + no_grad。
     _ = pc.forward_modules.eval()
     chunks: List[torch.Tensor] = []
     for batch in train_loader:
@@ -62,6 +71,7 @@ def extract_memorybank_features_before_sampling(
         else:
             images = batch
         images = images.to(torch.float).to(pc.device)
+        # 这里取的是 sampler 前特征，便于和建库前分布直接对齐。
         batch_feat = pc._embed(images, detach=False)  # Tensor [N_patches, D]
         chunks.append(batch_feat.detach().cpu())
 
@@ -90,6 +100,7 @@ def extract_backbone_features_raw(
         - pool="mean": returns [B, C] (mean over tokens)
         - pool="none": returns [B*N, C] (flatten tokens)
     """
+    # 直接复用 WAT 内部 feature_aggregator，避免重复注册 hook。
     agg = pc.forward_modules["feature_aggregator"].eval()
     chunks: List[torch.Tensor] = []
 
@@ -102,6 +113,7 @@ def extract_backbone_features_raw(
             images = batch
 
         images = images.to(torch.float).to(pc.device)
+        # 每个 batch 都拿到 {layer_name: feature_tensor}。
         feats_dict = agg(images)
         if layer not in feats_dict:
             raise KeyError(f"Layer {layer!r} not found in feature_aggregator outputs: {list(feats_dict.keys())}")
@@ -144,6 +156,7 @@ def run_umap(
     metric: str,
     n_jobs: int,
 ) -> np.ndarray:
+    """执行 UMAP 二维降维，返回 `Z.shape == [N, 2]`。"""
     import umap
 
     X = np.asarray(X, dtype=np.float32)
@@ -165,6 +178,7 @@ def run_umap(
 
 
 def main(args: argparse.Namespace) -> None:
+    """完整流程入口：提取特征 -> 可选采样 -> UMAP -> 绘图保存。"""
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     LOGGER.info("Using device: %s", device)
 
@@ -234,6 +248,7 @@ def main(args: argparse.Namespace) -> None:
             nn_method=wat.common.FaissNN(on_gpu=False, num_workers=4),
         )
 
+        # 特征来源二选一：WAT 嵌入 or 原始 backbone 层输出。
         if args.viz_feature_source == "wat":
             feats = extract_memorybank_features_before_sampling(pc, train_loader)
             LOGGER.info("[%s] wat memory features (before sampling): %s", bank, feats.shape)
@@ -272,6 +287,7 @@ def main(args: argparse.Namespace) -> None:
 
         # np.savez_compressed(os.path.join(out_dir, f"memorybank_raw_{bank}.npz"), features=feats)
 
+    # 合并多 bank 点云，形成 UMAP 的统一输入。
     X = np.concatenate(all_points, axis=0)
     y = np.concatenate(all_labels, axis=0)
 

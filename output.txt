@@ -1,0 +1,30 @@
+
+2026-03-26 01:04:56,485 - INFO - Dataloaders ready: train=28000 | test datasets={'adm': 1000, 'biggan': 1000, 'glide': 1000, 'midjourney': 1000, 'sdv5': 1000, 'vqdm': 1000, 'wukong': 1000}
+2026-03-26 01:05:09,034 - INFO - [adm] classification_accuracy_with_uncertainty=0.1400, classification_accuracy_on_certain_samples=0.6965, classification_certain_sample_coverage=0.2010, classification_uncertainty_rate=0.7990
+2026-03-26 01:05:09,035 - INFO - [adm] ai_detection_accuracy_with_uncertainty=0.1260, ai_detection_accuracy_on_certain_samples=0.6000, ai_detection_certain_sample_coverage=0.2100 (true_ai_samples=500, true_ai_certain_samples=105)
+2026-03-26 01:05:21,567 - INFO - [biggan] classification_accuracy_with_uncertainty=0.5100, classification_accuracy_on_certain_samples=0.9770, classification_certain_sample_coverage=0.5220, classification_uncertainty_rate=0.4780
+2026-03-26 01:05:21,568 - INFO - [biggan] ai_detection_accuracy_with_uncertainty=0.8900, ai_detection_accuracy_on_certain_samples=1.0000, ai_detection_certain_sample_coverage=0.8900 (true_ai_samples=500, true_ai_certain_samples=445)
+2026-03-26 01:05:33,594 - INFO - [glide] classification_accuracy_with_uncertainty=0.4280, classification_accuracy_on_certain_samples=0.9772, classification_certain_sample_coverage=0.4380, classification_uncertainty_rate=0.5620
+2026-03-26 01:05:33,595 - INFO - [glide] ai_detection_accuracy_with_uncertainty=0.7200, ai_detection_accuracy_on_certain_samples=1.0000, ai_detection_certain_sample_coverage=0.7200 (true_ai_samples=500, true_ai_certain_samples=360)
+2026-03-26 01:05:57,832 - INFO - [midjourney] classification_accuracy_with_uncertainty=0.2080, classification_accuracy_on_certain_samples=0.9585, classification_certain_sample_coverage=0.2170, classification_uncertainty_rate=0.7830
+2026-03-26 01:05:57,832 - INFO - [midjourney] ai_detection_accuracy_with_uncertainty=0.2980, ai_detection_accuracy_on_certain_samples=0.9933, ai_detection_certain_sample_coverage=0.3000 (true_ai_samples=500, true_ai_certain_samples=150)
+2026-03-26 01:06:12,400 - INFO - [sdv5] classification_accuracy_with_uncertainty=0.1160, classification_accuracy_on_certain_samples=0.9062, classification_certain_sample_coverage=0.1280, classification_uncertainty_rate=0.8720
+2026-03-26 01:06:12,400 - INFO - [sdv5] ai_detection_accuracy_with_uncertainty=0.1280, ai_detection_accuracy_on_certain_samples=1.0000, ai_detection_certain_sample_coverage=0.1280 (true_ai_samples=500, true_ai_certain_samples=64)
+2026-03-26 01:06:24,927 - INFO - [vqdm] classification_accuracy_with_uncertainty=0.1510, classification_accuracy_on_certain_samples=0.8935, classification_certain_sample_coverage=0.1690, classification_uncertainty_rate=0.8310
+2026-03-26 01:06:24,927 - INFO - [vqdm] ai_detection_accuracy_with_uncertainty=0.1620, ai_detection_accuracy_on_certain_samples=0.8526, ai_detection_certain_sample_coverage=0.1900 (true_ai_samples=500, true_ai_certain_samples=95)
+2026-03-26 01:06:40,404 - INFO - [wukong] classification_accuracy_with_uncertainty=0.1440, classification_accuracy_on_certain_samples=0.9231, classification_certain_sample_coverage=0.1560, classification_uncertainty_rate=0.8440
+2026-03-26 01:06:40,404 - INFO - [wukong] ai_detection_accuracy_with_uncertainty=0.1580, ai_detection_accuracy_on_certain_samples=0.9753, ai_detection_certain_sample_coverage=0.1620 (true_ai_samples=500, true_ai_certain_samples=81)
+2026-03-26 01:06:40,766 - INFO - Saved per-image test scores to runs/test_scores.csv
+2026-03-26 01:06:40,779 - INFO - Saved per-dataset AI evaluation summary to runs/per_dataset_ai_evaluation_summary.csv
+2026-03-26 01:06:40,780 - INFO - Saved per-dataset per-AI-generator summary to runs/per_dataset_per_ai_generator_evaluation_summary.csv
+2026-03-26 01:06:40,781 - INFO - Per-dataset classification_accuracy_with_uncertainty: {'adm': 0.14, 'biggan': 0.51, 'glide': 0.428, 'midjourney': 0.208, 'sdv5': 0.116, 'vqdm': 0.151, 'wukong': 0.144}
+2026-03-26 01:06:40,781 - INFO - Per-dataset classification_accuracy_on_certain_samples: {'adm': 0.696517, 'biggan': 0.977011, 'glide': 0.977169, 'midjourney': 0.958525, 'sdv5': 0.90625, 'vqdm': 0.893491, 'wukong': 0.923077}
+2026-03-26 01:06:40,781 - INFO - Per-dataset classification_uncertainty_rate: {'adm': 0.799, 'biggan': 0.478, 'glide': 0.562, 'midjourney': 0.783, 'sdv5': 0.872, 'vqdm': 0.831, 'wukong': 0.844}
+2026-03-26 01:06:40,781 - INFO - Per-dataset ai_detection_accuracy_with_uncertainty: {'adm': 0.126, 'biggan': 0.89, 'glide': 0.72, 'midjourney': 0.298, 'sdv5': 0.128, 'vqdm': 0.162, 'wukong': 0.158}
+2026-03-26 01:06:40,782 - INFO - Per-dataset ai_detection_accuracy_on_certain_samples: {'adm': 0.6, 'biggan': 1.0, 'glide': 1.0, 'midjourney': 0.993333, 'sdv5': 1.0, 'vqdm': 0.852632, 'wukong': 0.975309}
+2026-03-26 01:06:40,782 - INFO - Overall classification_certain_sample_coverage=0.2616, classification_uncertainty_rate=0.7384 (samples=7000)
+2026-03-26 01:06:40,784 - INFO - Overall classification_accuracy_with_uncertainty: 0.2424 (samples=7000)
+2026-03-26 01:06:40,784 - INFO - Overall ai_detection_accuracy_with_uncertainty=0.3546, ai_detection_accuracy_on_certain_samples=0.9546, ai_detection_certain_sample_coverage=0.3714 (true_ai_samples=3500, true_ai_certain_samples=1300)
+2026-03-26 01:06:40,785 - INFO - Overall classification_accuracy_on_certain_samples: 0.9268 (samples=1831)
+2026-03-26 01:06:40,791 - INFO - Saved overall AI evaluation summary to runs/overall_ai_evaluation_summary.csv
+2026-03-26 01:06:40,792 - INFO - Saved overall per-AI-generator summary to runs/overall_per_ai_generator_evaluation_summary.csv

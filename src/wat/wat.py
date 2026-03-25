@@ -1,3 +1,13 @@
+"""
+WAT 主体模块。
+
+本文件覆盖 `PROJECT_DETAILED_COMMENTS.md` 第 3 节（`src/wat/wat.py`）的注释落地：
+1) `to_nchw_if_vit(...)`：统一 ViT/CNN 特征形状；
+2) `WAT.load(...)`：组装 backbone + 预处理 + 聚合 + KNN scorer；
+3) `_fill_memory_bank(...)`：训练阶段抽特征并建立 memory bank；
+4) `predict_with_meta(...)`：推理阶段同时返回分数和生成器元信息。
+"""
+
 import logging
 import os
 import pickle
@@ -38,6 +48,7 @@ def to_nchw_if_vit(x: torch.Tensor, allow_dist_token: bool = True) -> torch.Tens
     else:
         raise ValueError(f"Expect 3D [B,N,C] or 4D [B,C,H,W], got {x.shape}")
 
+    # 局部工具：尝试把 [B, N, C] 还原成 [B, C, H, W]（要求 N 是平方数）。
     def try_square(tokens: torch.Tensor) -> torch.Tensor:
         B_, N_, C_ = tokens.shape
         H = int(N_ ** 0.5)
@@ -122,7 +133,7 @@ class WAT(torch.nn.Module):
             featuresampler: [wat.sampler] 采样器，用于对特征进行采样处理。默认使用 `IdentitySampler`，表示不进行任何采样。
             nn_method: 最近邻计算方法，可选 `FaissNN`（如已安装）或默认 `BruteNN`。
         """
-        # 将传入的骨干网络模型（backbone）转移到指定的计算设备（CPU 或 GPU）
+        # 1) 将骨干网络移动到指定设备，并保存关键配置。
         self.backbone = backbone.to(device)
 
         # 将需要提取特征的层（`layers_to_extract_from`）保存为类的成员变量
@@ -130,31 +141,28 @@ class WAT(torch.nn.Module):
         self.input_shape = input_shape
         self.device = device
 
-        # 使用 `torch.nn.ModuleDict` 来保存模块
+        # 2) 用 ModuleDict 管理前向子模块，便于 save/load 时统一访问。
         self.forward_modules = torch.nn.ModuleDict({})
 
-        # 创建特征提取器：NetworkFeatureAggregator，使用指定的 backbone 和提取的层
+        # 3) 构建“中间层特征提取器”（hook 版），仅抓取指定层输出。
         feature_aggregator = wat.common.NetworkFeatureAggregator(
             self.backbone, self.layers_to_extract_from, self.device
         )
 
-        # 获取特征提取器输出的特征维度，输入的形状 `input_shape` 会传递给它
-        # 计算每个抽取层的通道数（特征维）
+        # 4) 推断每个抽取层的通道维度，用于后续 Preprocessing 对齐。
         feature_dimensions = feature_aggregator.feature_dimensions(input_shape)
         self.forward_modules["feature_aggregator"] = feature_aggregator
 
-        # 自动推断 pretrain_embed_dimension：当传入值为 None/0/负数时，
-        # 取所选层通道数的最大值，作为预处理输出维度（自适应池化目标）
+        # 5) 自动推断 pretrain_embed_dimension：
+        #    传入 <=0 时，使用抽取层的最大通道数作为规整维度。
         auto_pre_dim = max(int(d) for d in feature_dimensions) if len(feature_dimensions) else target_embed_dimension
         pre_dim = int(pretrain_embed_dimension) if (pretrain_embed_dimension and pretrain_embed_dimension > 0) else auto_pre_dim
 
-        # 使用 patch 级 Gram 预处理
-        # preprocessing = wat.common.PatchGramPreprocessing(output_dim=pre_dim)
-        # 配置预处理层：将每层展平后自适应池化到 pre_dim，再堆叠供后续聚合
+        # 6) 预处理层：把每层特征映射到统一长度 pre_dim。
         preprocessing = wat.common.Preprocessing(feature_dimensions, pre_dim)
         self.forward_modules["preprocessing"] = preprocessing
 
-        # 配置嵌入层：目标嵌入维度用于训练后的特征空间转换
+        # 7) 聚合层：将多层预处理特征压缩到最终 target_embed_dimension。
         self.target_embed_dimension = target_embed_dimension
         preadapt_aggregator = wat.common.Aggregator(target_dim=target_embed_dimension)
 
@@ -164,13 +172,13 @@ class WAT(torch.nn.Module):
         # 将 `preadapt_aggregator` 添加到 `forward_modules` 中
         self.forward_modules["preadapt_aggregator"] = preadapt_aggregator
 
-        # 配置最近邻异常评分器：`NearestNeighbourScorer`，使用指定的最近邻方法和数量
+        # 8) 最近邻评分器：用于 memory bank 检索和异常分数计算。
         self.anomaly_scorer = wat.common.NearestNeighbourScorer(
             n_nearest_neighbours=anomaly_score_num_nn,
             nn_method=nn_method,
         )
 
-        # 将采样器赋值给类的成员变量，默认使用 `IdentitySampler`（不进行特征采样）
+        # 9) 采样器：训练建库时可做 coreset 缩减；默认 Identity（不采样）。
         self.featuresampler = featuresampler
 
     def embed(self, data):
@@ -269,6 +277,7 @@ class WAT(torch.nn.Module):
                 一般为 torch.utils.data.DataLoader，迭代输出训练图像（通常是正常样本），
                 其元素可以是张量或包含键 "image" 的字典。
         """
+        # memory bank 提取固定在 eval/no_grad，避免训练态噪声（如 BN/Dropout）。
         _ = self.forward_modules.eval()
 
         def _image_to_features(input_image, return_shapes=False):
@@ -276,6 +285,7 @@ class WAT(torch.nn.Module):
                 input_image = input_image.to(torch.float).to(self.device)
                 return self._embed(input_image, provide_patch_shapes=return_shapes)
 
+        # features 保存每个 batch 的向量，labels 保存每个向量对应的 generator 标签。
         features = []
         labels = []
         with tqdm.tqdm(
@@ -288,7 +298,10 @@ class WAT(torch.nn.Module):
                     image = image["image"]
                 feats, _ = _image_to_features(image, return_shapes=True)
 
-                # 解析标签：优先使用数据集返回的 generator（ai 用生成器类别，nature 统一为 nature）
+                # 标签解析优先级：
+                # 1) dataset 直接返回 generator；
+                # 2) 回落到路径推断；
+                # 3) 最终兜底 unknown。
                 batch_dataset_names = []
                 if isinstance(meta, dict) and meta.get("generator") is not None:
                     gen = meta.get("generator")
@@ -322,7 +335,7 @@ class WAT(torch.nn.Module):
                     else:
                         batch_dataset_names = ["unknown"] * image.shape[0]
 
-                # 展平后特征顺序与 _embed 一致：按图像顺序堆叠
+                # 与特征行顺序保持一致，逐行追加标签。
                 for name in batch_dataset_names:
                     labels.append(name)
                 features.append(feats)
@@ -331,8 +344,8 @@ class WAT(torch.nn.Module):
         features = np.concatenate(features, axis=0)
         labels = np.asarray(labels).reshape(-1)
 
+        # 采样器只改变行数，不改变“每行特征的语义”；标签需同步裁剪。
         features = self.featuresampler.run(features)
-        # 若采样器提供了索引，同步裁剪标签
         sampler_indices = getattr(self.featuresampler, "last_indices", None)
         if sampler_indices is not None and sampler_indices is not slice(None):
             labels = labels[sampler_indices]
@@ -348,8 +361,11 @@ class WAT(torch.nn.Module):
     def predict_with_meta(self, data):
         """
         与 predict 相同，但额外返回每张图像最近邻所属的标签与置信度。
-        - DataLoader: 返回 (scores, masks, labels_gt, paths, nearest_labels, nearest_confs, gt_generators, gt_dataset_names)
-        - Tensor:      返回 (scores, masks, nearest_labels, nearest_confs)
+        - DataLoader: 返回
+          (scores, masks, labels_gt, paths, nearest_labels, nearest_confs,
+           gt_generators, gt_dataset_names, nearest_base_confs, nearest_diversity_penalties)
+        - Tensor: 返回
+          (scores, masks, nearest_labels, nearest_confs, nearest_base_confs, nearest_diversity_penalties)
         """
         if isinstance(data, torch.utils.data.DataLoader):
             return self._predict_dataloader(data, return_meta=True)
@@ -373,6 +389,11 @@ class WAT(torch.nn.Module):
         paths = []
         datasets_pred = []
         confs_pred = []
+        base_confs_pred = []
+        diversity_penalties_pred = []
+        topk_unique_label_counts_pred = []
+        topk_entropy_normalized_pred = []
+        topk_unique_ratio_pred = []
         generators_gt = []
         dataset_names_gt = []
 
@@ -398,10 +419,20 @@ class WAT(torch.nn.Module):
                     raise ValueError(
                         "Batch 中未找到标签字段 'is_ai'，请检查 dataloader 的返回字典。")
 
-                batch_scores, batch_masks, batch_datasets, batch_confs = (
+                (
+                    batch_scores,
+                    batch_masks,
+                    batch_datasets,
+                    batch_confs,
+                    batch_base_confs,
+                    batch_diversity_penalties,
+                    batch_topk_unique_label_counts,
+                    batch_topk_entropy_normalized,
+                    batch_topk_unique_ratio,
+                ) = (
                     self._predict(images, return_meta=True)
                     if return_meta
-                    else self._predict(images, return_meta=False) + (None, None)
+                    else self._predict(images, return_meta=False) + (None, None, None, None, None, None, None)
                 )
                 scores.extend(batch_scores)
                 masks.extend(batch_masks)
@@ -429,9 +460,33 @@ class WAT(torch.nn.Module):
                     datasets_pred.extend(batch_datasets)
                 if return_meta and batch_confs is not None:
                     confs_pred.extend(batch_confs)
+                if return_meta and batch_base_confs is not None:
+                    base_confs_pred.extend(batch_base_confs)
+                if return_meta and batch_diversity_penalties is not None:
+                    diversity_penalties_pred.extend(batch_diversity_penalties)
+                if return_meta and batch_topk_unique_label_counts is not None:
+                    topk_unique_label_counts_pred.extend(batch_topk_unique_label_counts)
+                if return_meta and batch_topk_entropy_normalized is not None:
+                    topk_entropy_normalized_pred.extend(batch_topk_entropy_normalized)
+                if return_meta and batch_topk_unique_ratio is not None:
+                    topk_unique_ratio_pred.extend(batch_topk_unique_ratio)
 
         if return_meta:
-            return (scores, masks, labels_gt, paths, datasets_pred, confs_pred, generators_gt, dataset_names_gt)
+            return (
+                scores,
+                masks,
+                labels_gt,
+                paths,
+                datasets_pred,
+                confs_pred,
+                generators_gt,
+                dataset_names_gt,
+                base_confs_pred,
+                diversity_penalties_pred,
+                topk_unique_label_counts_pred,
+                topk_entropy_normalized_pred,
+                topk_unique_ratio_pred,
+            )
         return (scores, masks, labels_gt, paths)
 
     def _predict(self, images, return_meta: bool = False):
@@ -446,23 +501,28 @@ class WAT(torch.nn.Module):
         images = images.to(torch.float).to(self.device)
         _ = self.forward_modules.eval()
 
-        # 获取 batch 大小（后面 reshape、聚合时要用）
+        # batchsize 只用于把 patch/向量结果回折到图像维。
         batchsize = images.shape[0]
 
         with torch.no_grad():
-            # 提取图像的 patch 特征嵌入
+            # 抽取图像向量（当前实现为图像级向量，不再显式输出 patch 热力图）。
             features, _ = self._embed(images, provide_patch_shapes=True)
 
             # 将特征转换为 numpy 数组，以便交给 FAISS/KNN 模块
             features = np.asarray(features)
 
-            # 使用记忆库进行最近邻搜索
+            # 在 memory bank 中检索最近邻，返回距离与标签投票信息。
             predict_out = self.anomaly_scorer.predict([features])
             patch_scores = predict_out[0]
             nearest_datasets = predict_out[3] if len(predict_out) > 3 else None
             nearest_confs = predict_out[4] if len(predict_out) > 4 else None
+            nearest_base_confs = predict_out[7] if len(predict_out) > 7 else None
+            nearest_diversity_penalties = predict_out[8] if len(predict_out) > 8 else None
+            nearest_topk_unique_label_counts = predict_out[6] if len(predict_out) > 6 else None
+            nearest_topk_entropy_normalized = predict_out[9] if len(predict_out) > 9 else None
+            nearest_topk_unique_ratio = predict_out[10] if len(predict_out) > 10 else None
 
-            # 直接把每行结果视为图像分数
+            # 一张图对应一行分数；保留 mean 逻辑兼容历史 patch 代码路径。
             image_scores = patch_scores.reshape(batchsize, -1).mean(axis=1)
 
             image_datasets = None
@@ -471,10 +531,39 @@ class WAT(torch.nn.Module):
             image_confs = None
             if nearest_confs is not None and len(nearest_confs):
                 image_confs = [float(nearest_confs[i]) for i in range(len(image_scores))]
+            image_base_confs = None
+            if nearest_base_confs is not None and len(nearest_base_confs):
+                image_base_confs = [float(nearest_base_confs[i]) for i in range(len(image_scores))]
+            image_diversity_penalties = None
+            if nearest_diversity_penalties is not None and len(nearest_diversity_penalties):
+                image_diversity_penalties = [float(nearest_diversity_penalties[i]) for i in range(len(image_scores))]
+            image_topk_unique_label_counts = None
+            if nearest_topk_unique_label_counts is not None and len(nearest_topk_unique_label_counts):
+                image_topk_unique_label_counts = [
+                    int(nearest_topk_unique_label_counts[i]) for i in range(len(image_scores))
+                ]
+            image_topk_entropy_normalized = None
+            if nearest_topk_entropy_normalized is not None and len(nearest_topk_entropy_normalized):
+                image_topk_entropy_normalized = [
+                    float(nearest_topk_entropy_normalized[i]) for i in range(len(image_scores))
+                ]
+            image_topk_unique_ratio = None
+            if nearest_topk_unique_ratio is not None and len(nearest_topk_unique_ratio):
+                image_topk_unique_ratio = [float(nearest_topk_unique_ratio[i]) for i in range(len(image_scores))]
 
         masks_placeholder = [None] * batchsize
         if return_meta:
-            return [float(s) for s in image_scores], masks_placeholder, image_datasets, image_confs
+            return (
+                [float(s) for s in image_scores],
+                masks_placeholder,
+                image_datasets,
+                image_confs,
+                image_base_confs,
+                image_diversity_penalties,
+                image_topk_unique_label_counts,
+                image_topk_entropy_normalized,
+                image_topk_unique_ratio,
+            )
         return [float(s) for s in image_scores], masks_placeholder
 
 
@@ -560,6 +649,13 @@ class WAT(torch.nn.Module):
         # 1) 读取保存的 WAT 参数字典（结构配置）
         with open(self._params_file(load_path, prepend), "rb") as load_file:
             wat_params = pickle.load(load_file)
+
+        # 兼容历史参数键名：
+        # save_to_path 使用的是 "anomaly_scorer_num_nn"，
+        # 但 load(...) 需要的是 "anomaly_score_num_nn"。
+        # 若不做映射，load 时会回落到默认 1，导致推理 top-k 意外退化。
+        if "anomaly_scorer_num_nn" in wat_params and "anomaly_score_num_nn" not in wat_params:
+            wat_params["anomaly_score_num_nn"] = wat_params["anomaly_scorer_num_nn"]
 
         # 2) 根据保存的 backbone 名称重新构建 backbone 模型
         wat_params["backbone"] = wat.backbones.load(

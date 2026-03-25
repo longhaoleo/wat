@@ -1,4 +1,12 @@
-# wat/datasets/tiny_genimage.py
+"""
+Tiny-GenImage 数据集读取模块。
+
+对应 `PROJECT_DETAILED_COMMENTS.md` 第 6 节：
+- `DatasetSplit` 管理 `train/val/test`；
+- `Dataset.get_image_data(...)` 支持 `split/ai/<generator>/*.png` 目录；
+- `Dataset.__getitem__(...)` 返回评估所需全部元信息字段。
+"""
+
 import os, random
 from enum import Enum
 from typing import List, Tuple, Optional
@@ -11,6 +19,7 @@ from torchvision import transforms as T
 
 
 class DatasetSplit(Enum):
+    """数据划分枚举。"""
     TRAIN = "train"
     VAL   = "val"
     TEST  = "test"  
@@ -69,6 +78,7 @@ class Dataset(TorchDataset):
             - 训练：保留 type_name（调试用，不参与监督，可存为字符串）
             - 验/测：相对 bank 标签，in-bank=0, out-of-bank=1
         """
+        # split 根目录：<dataset_root>/<train|val|test>
         split_dir = os.path.join(self.source, self.split.value)
         if not os.path.isdir(split_dir):
             print(f"[tiny_genimage] Warning: split path not found: {split_dir}")
@@ -80,7 +90,7 @@ class Dataset(TorchDataset):
             if os.path.isdir(os.path.join(split_dir, d))
         ]
 
-        # 训练：只取指定 bank 的目录
+        # 训练阶段可指定 bank（ai / nature），只从对应目录建库。
         if self.split == DatasetSplit.TRAIN and self.bankname is not None:
             type_dirs = [self.bankname]
 
@@ -119,7 +129,7 @@ class Dataset(TorchDataset):
         t, generator, image_path = self.imgpaths[idx]
         image_types = "RGB"
         try:
-            # 读图更稳健一点
+            # 读图失败时回退空白图，避免单坏图中断整个评估流程。
             with Image.open(image_path) as im:
                 image = im.convert(image_types)  
         except (IOError, OSError) as e:
@@ -130,7 +140,9 @@ class Dataset(TorchDataset):
         # 对图像进行转换
         image = self.transform(image)
         
+        # 二分类真值：ai=1, nature=0
         is_ai = 1 if t == "ai" else 0
+        # 历史兼容字段：相对当前 bank 判断是否 anomaly。
         is_anomaly = 1 if (self.bankname is not None and t != self.bankname) else 0
 
         return {

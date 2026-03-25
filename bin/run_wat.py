@@ -1,3 +1,14 @@
+"""
+WAT 训练/推理主入口。
+
+本文件对应 `PROJECT_DETAILED_COMMENTS.md` 第 1 节：
+1) 构建与数据准备；
+2) 训练阶段（memory bank 构建）；
+3) 推理评估阶段（调用 `wat.eval_tools`）；
+4) CSV 结果输出；
+5) overall 指标聚合口径。
+"""
+
 # run_wat.py
 import os
 import argparse
@@ -6,12 +17,12 @@ from typing import Dict, Any, Tuple, Callable, List, Optional
 
 import numpy as np
 import torch
-import csv
 
 import wat.backbones
 import wat.common
 import wat.wat
 import wat.sampler
+import wat.eval_tools as eval_tools
 from wat.datasets.tiny_genimage import Dataset, DatasetSplit
 
 
@@ -19,23 +30,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 LOGGER = logging.getLogger("run_wat")
 
 
-def fuse_ai_margin_with_conf(
-    raw_margin: np.ndarray,
-    ai_conf: np.ndarray,
-    conf_floor: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    将 AI 库 generator 置信度融合进二分类 margin。
-    - raw_margin = score_nature - score_ai，越大越偏向 AI；
-    - gate = conf_floor + (1-conf_floor) * clip(ai_conf, 0, 1)；
-    - adj_margin = raw_margin * gate。
-    """
-    conf = np.asarray(ai_conf, dtype=float).reshape(-1)
-    conf = np.where(np.isfinite(conf), conf, 0.0)
-    conf = np.clip(conf, 0.0, 1.0)
-    conf_floor = float(np.clip(conf_floor, 0.0, 1.0))
-    gate = conf_floor + (1.0 - conf_floor) * conf
-    return np.asarray(raw_margin, dtype=float).reshape(-1) * gate, gate
 
 
 # -----------------------------
@@ -116,6 +110,20 @@ def get_wat(
 # -----------------------------
 def get_sampler(name: str, percentage: float, device: torch.device):
     """根据配置返回特征采样器，主要用于控制记忆库容量。"""
+    def _parse_optional_int_suffix(text: str, default_value: int) -> int:
+        """
+        解析类似 `density:50`、`kmeans_topc:3` 这种后缀整数配置。
+        - 没有 `:` 时直接返回默认值；
+        - `:` 后不是纯整数时也回退默认值；
+        - 不使用 try/except，避免把配置错误静默吞掉。
+        """
+        if ":" not in text:
+            return default_value
+        suffix = text.split(":", 1)[1].strip()
+        if suffix.isdigit():
+            return int(suffix)
+        return default_value
+
     name = name.lower()
     if name == "pca":
         return wat.common.PCASampler(percentage)
@@ -128,23 +136,13 @@ def get_sampler(name: str, percentage: float, device: torch.device):
         return wat.sampler.CentralSampler(percentage, use_mahalanobis=True)
     # 密度采样：高密度优先（可带后缀 n_neighbors，如 density:10）
     if name.startswith("density"):
-        n_neighbors = 50
-        if ":" in name:
-            try:
-                n_neighbors = int(name.split(":", 1)[1])
-            except Exception:
-                pass
+        n_neighbors = _parse_optional_int_suffix(name, default_value=50)
         return wat.sampler.DensitySampler(percentage, n_neighbors=n_neighbors)
     # KMeans / TopC：kmeans_topc[:C]（默认 C=2），普通 kmeans 等同于 topc:1
     if name.startswith("kmeans_topc") or name == "kmeans":
         topk = 1
         if name.startswith("kmeans_topc"):
-            topk = 2
-            if ":" in name:
-                try:
-                    topk = int(name.split(":", 1)[1])
-                except Exception:
-                    pass
+            topk = _parse_optional_int_suffix(name, default_value=2)
         km = wat.sampler.KMeansSampler(percentage, per_cluster_topk=topk)
         # 默认用 MiniBatchKMeans，提高大规模性能
         km.use_minibatch = True
@@ -312,7 +310,6 @@ def train_memorybank(build_pc_fn, sampler, device, nn_method, train_loader) -> w
     return pc
 
 
-
 # -----------------------------
 # 主流程
 # -----------------------------
@@ -325,14 +322,15 @@ def main(args):
             1) 从磁盘加载已训练好的 WAT 记忆库；
             2) 在指定 test/val split 上执行推理/评估。
     """
+    # [1.6-入口] 数值问题尽早显式抛错，避免静默污染指标。
     np.seterr(all='raise')
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     LOGGER.info("Using device: %s", device)
 
-    # 数据路径
+    # [1.6-路径] 展开 ~，避免跨环境启动时路径歧义。
     data_path = os.path.expanduser(args.data_path)
 
-    # 训练 / 测试数据集名称
+    # [1.6-数据集] 训练集必须显式存在；测试集未给时默认复用训练集列表。
     train_dataset_names = list(args.dataset_names or [])
     if not train_dataset_names:
         raise RuntimeError("至少需要提供一个用于训练的 dataset 名称，通过 --dataset_names 指定。")
@@ -343,11 +341,11 @@ def main(args):
         test_dataset_names,
     )
 
-    # 读取 banknames
+    # [1.6-bank] 固定语义：banknames[0]=ai, banknames[1]=nature。
     banknames = args.banknames
     bank_ai, bank_nature = banknames[0], banknames[1]
 
-    # Sampler
+    # [1.6-sampler] 训练建库采样器（identity/random/central/...）。
     sampler = get_sampler(args.sampler_name, args.coreset_percentage, device)
 
     # -----------------------------
@@ -386,6 +384,7 @@ def main(args):
                 faiss_on_gpu=args.faiss_on_gpu,
                 faiss_num_workers=args.faiss_num_workers,
             )
+            # 单个 bank 的完整建库过程：抽特征 -> sampler -> KNN fit。
             pc = train_memorybank(build_pc, sampler, device, nn_method, loaders_for_bank["train"])
 
             # 记忆库保存路径：<pc_save_root>/<bank>/
@@ -397,7 +396,7 @@ def main(args):
 
             pcs[bank] = pc
 
-        # 训练阶段只需写出记忆库
+        # [1.6-提前返回] 纯 train 模式到此结束，不进入推理评估。
         if args.phase == "train":
             return
 
@@ -405,7 +404,6 @@ def main(args):
     # Phase 2: 仅推理/评估
     #   - 假设 WAT 记忆库已在 Phase 1 中训练好并保存；
     #   - 这里只负责：加载 WAT 记忆库，在 test 上做推理/评估；
-    #   - 不再依赖 val，也无需额外分类器。
     # -----------------------------
     if args.phase not in ("infer", "both"):
         raise ValueError(f"Unknown phase: {args.phase}. Expected 'train', 'infer' or 'both'.")
@@ -420,10 +418,20 @@ def main(args):
         nn_method = wat.common.BruteNN()
         pc = wat.wat.WAT(device)
         pc.load_from_path(load_path=load_dir, device=device, nn_method=nn_method)
+        # 推理阶段允许用当前 CLI 的 --anomaly_scorer_k 覆盖已保存 bank 的 top-k。
+        # 便于快速做 k 敏感性分析（不必重训 memory bank）。
+        if int(args.anomaly_scorer_k) > 0 and pc.anomaly_scorer.n_nearest_neighbours != int(args.anomaly_scorer_k):
+            LOGGER.info(
+                "Override loaded top-k for bank '%s': %d -> %d",
+                bank,
+                pc.anomaly_scorer.n_nearest_neighbours,
+                int(args.anomaly_scorer_k),
+            )
+            pc.anomaly_scorer.n_nearest_neighbours = int(args.anomaly_scorer_k)
         pcs[bank] = pc
         LOGGER.info("Loaded WAT memory bank for '%s' from %s", bank, load_dir)
 
-    # 2) 基于“测试数据集列表”构建 DataLoader 工厂，并拿到公共 test Loader
+    # [1.6-测试载入] 每个 dataset 各自构建公共 test/val loader。
     build_dataloader_test = get_dataloaders(
         data_path=data_path,
         dataset_names=test_dataset_names,
@@ -434,216 +442,345 @@ def main(args):
     )
     common_loaders = build_dataloader_test(seed=args.seed, bankname=None)
 
-    summary_allacc_logs: Dict[str, float] = {}
-    summary_certainacc_logs: Dict[str, float] = {}
-    summary_uncertain_logs: Dict[str, float] = {}
-    genacc_logs: Dict[str, float] = {}
-    csv_rows: List[List[Any]] = []
-    all_labels_total: List[int] = []
-    all_preds_total: List[int] = []
-    all_preds_certain: List[int] = []
-    all_labels_certain: List[int] = []
-    all_uncertain_flags: List[int] = []
-    all_gen_gt: List[str] = []
-    all_gen_pred: List[str] = []
-    all_gen_is_ai: List[int] = []
-    all_gen_is_tp_ai: List[int] = []
+    # -----------------------------
+    # [1.6-统计容器] 数据集级日志 + CSV 行缓存 + overall 全局缓冲区
+    # -----------------------------
+    # 1) 二分类总体准确率（ai vs nature）
+    summary_classification_accuracy_with_uncertainty_logs: Dict[str, float] = {}
+    summary_classification_accuracy_on_certain_samples_logs: Dict[str, float] = {}
+    summary_classification_uncertainty_rate_logs: Dict[str, float] = {}
 
+    # 2) 真实 AI 样本上的“判别为 AI”准确率
+    summary_ai_detection_accuracy_with_uncertainty_logs: Dict[str, float] = {}
+    summary_ai_detection_accuracy_on_certain_samples_logs: Dict[str, float] = {}
+    summary_ai_detection_certain_sample_coverage_logs: Dict[str, float] = {}
+
+    # 3) 各类 CSV 输出缓存
+    per_image_rows: List[List[Any]] = []
+    per_dataset_rows: List[List[Any]] = []
+    per_dataset_per_generator_rows: List[List[Any]] = []
+    overall_per_generator_rows: List[List[Any]] = []
+
+    # 4) 全局统计缓存（跨数据集合并）
+    all_labels_total: List[int] = []
+    all_predictions_total: List[int] = []
+    all_labels_on_certain_samples: List[int] = []
+    all_predictions_on_certain_samples: List[int] = []
+    all_uncertainty_flags: List[int] = []
+    all_ground_truth_generators: List[str] = []
+    all_ground_truth_is_ai_flags: List[int] = []
+    all_predicted_is_ai_flags: List[int] = []
+
+    # [1.6-逐数据集评估] 每个数据集都走完整 infer -> metrics -> merge 流程。
     for ds_name in test_dataset_names:
         test_loader = common_loaders["test"].get(ds_name)
         if test_loader is None:
             LOGGER.warning("Dataset %s missing test loader, skip evaluation.", ds_name)
             continue
 
-        # 仅对 test 做推理/评估：双 bank 分别打分
-        (
-            test_scores_a,
-            _,
-            y_test,
-            test_path_a,
-            gen_pred_a,
-            gen_conf_a,
-            gt_generators,
-            gt_dataset_names,
-        ) = pcs[bank_ai].predict_with_meta(test_loader)
-        test_scores_b, _, y_test, test_path_b, nat_pred_b, nat_conf_b, _, _ = pcs[bank_nature].predict_with_meta(test_loader)
-
-        test_scores_a_np = np.asarray(test_scores_a, dtype=float).reshape(-1)
-        test_scores_b_np = np.asarray(test_scores_b, dtype=float).reshape(-1)
-        y_test_np = np.asarray(y_test, dtype=int).reshape(-1)
-
-        paths = [str(p) for p in test_path_a] if test_path_a is not None else ["-"] * len(test_scores_a_np)
-        gen_a = gen_pred_a or ["unknown"] * len(test_scores_a_np)
-        gen_a_conf = np.asarray(gen_conf_a or [float("nan")] * len(test_scores_a_np), dtype=float).reshape(-1)
-        nat_b = nat_pred_b or ["nature"] * len(test_scores_a_np)
-        gt_gen = gt_generators or ["unknown"] * len(test_scores_a_np)
-        gt_ds = gt_dataset_names or [ds_name] * len(test_scores_a_np)
-
-        raw_margin = (test_scores_b_np - test_scores_a_np)  # >0 偏向 AI，<0 偏向 nature
-        adj_margin, conf_gate = fuse_ai_margin_with_conf(
-            raw_margin=raw_margin,
-            ai_conf=gen_a_conf,
-            conf_floor=args.ai_conf_floor,
+        dataset_result = eval_tools.evaluate_single_test_dataset(
+            dataset_name=ds_name,
+            test_loader=test_loader,
+            model_ai=pcs[bank_ai],
+            model_nature=pcs[bank_nature],
+            ai_conf_floor=args.ai_conf_floor,
+            uncertain_eps=args.uncertain_eps,
+            logger=LOGGER,
         )
-        uncertain_mask = np.abs(adj_margin) < float(args.uncertain_eps)
-        preds = np.where(uncertain_mask, -1, (adj_margin > 0.0).astype(int))  # -1: uncertain
-        certain_mask = preds != -1
 
-        # all_acc: 全样本准确率；uncertain(-1) 会自然记为错误
-        all_acc = float((preds == y_test_np).mean()) if len(y_test_np) else float("nan")
-        if certain_mask.any():
-            acc_certain = float((preds[certain_mask] == y_test_np[certain_mask]).mean())
-        else:
-            acc_certain = float("nan")
-        coverage = float(certain_mask.mean()) if len(certain_mask) else 0.0
-        uncertain_rate = 1.0 - coverage
-        summary_allacc_logs[ds_name] = all_acc
-        summary_certainacc_logs[ds_name] = acc_certain
-        summary_uncertain_logs[ds_name] = uncertain_rate
+        # (a) 写入数据集级 summary 字典（供日志打印）
+        summary_classification_accuracy_with_uncertainty_logs[ds_name] = dataset_result[
+            "classification_accuracy_with_uncertainty"
+        ]
+        summary_classification_accuracy_on_certain_samples_logs[ds_name] = dataset_result[
+            "classification_accuracy_on_certain_samples"
+        ]
+        summary_classification_uncertainty_rate_logs[ds_name] = dataset_result["classification_uncertainty_rate"]
+        summary_ai_detection_accuracy_with_uncertainty_logs[ds_name] = dataset_result[
+            "ai_detection_accuracy_with_uncertainty"
+        ]
+        summary_ai_detection_accuracy_on_certain_samples_logs[ds_name] = dataset_result[
+            "ai_detection_accuracy_on_certain_samples"
+        ]
+        summary_ai_detection_certain_sample_coverage_logs[ds_name] = dataset_result[
+            "ai_detection_certain_sample_coverage"
+        ]
+        # (b) 写入 CSV 缓存（样本级 / 数据集级 / 数据集-生成器级）
+        per_dataset_rows.append(dataset_result["per_dataset_row"])
+        per_dataset_per_generator_rows.extend(dataset_result["per_dataset_per_generator_rows"])
+        per_image_rows.extend(dataset_result["per_image_rows"])
+
+        # (c) 写入 overall 缓冲区（跨数据集合并）
+        global_buffers = dataset_result["global_buffers"]
+        all_labels_total.extend(global_buffers["labels_total"])
+        all_predictions_total.extend(global_buffers["predictions_total"])
+        all_labels_on_certain_samples.extend(global_buffers["labels_on_certain_samples"])
+        all_predictions_on_certain_samples.extend(global_buffers["predictions_on_certain_samples"])
+        all_uncertainty_flags.extend(global_buffers["uncertainty_flags"])
+        all_ground_truth_generators.extend(global_buffers["ground_truth_generators"])
+        all_ground_truth_is_ai_flags.extend(global_buffers["ground_truth_is_ai_flags"])
+        all_predicted_is_ai_flags.extend(global_buffers["predicted_is_ai_flags"])
+    # [1.4] 按样本导出明细（用于后续误判排查）。
+    eval_tools.save_csv_rows(
+        output_csv_path=os.path.join("runs", "test_scores.csv"),
+        header=[
+            "dataset_name",
+            "image_path",
+            "anomaly_score_from_ai_bank",
+            "anomaly_score_from_nature_bank",
+            "relative_difference_to_nature_score",
+            "symmetric_score_difference",
+            "ground_truth_is_ai",
+            "predicted_is_ai_with_uncertainty",
+            "predicted_label_text",
+            "uncertainty_flag",
+            "raw_margin_nature_minus_ai",
+            "confidence_adjusted_margin_nature_minus_ai",
+            "ai_confidence_gate_weight",
+            "predicted_generator_for_final_label",
+            "predicted_generator_from_ai_bank",
+            "predicted_generator_confidence_from_ai_bank",
+            "predicted_generator_base_confidence_before_diversity_penalty",
+            "predicted_generator_diversity_penalty",
+            "topk_unique_label_count",
+            "topk_entropy_normalized",
+            "topk_unique_ratio",
+            "predicted_label_from_nature_bank",
+            "ground_truth_generator_name",
+            "ground_truth_dataset_name",
+        ],
+        rows=per_image_rows,
+        success_message="Saved per-image test scores to %s",
+        logger=LOGGER,
+    )
+
+    # [1.4] 按数据集导出汇总指标。
+    eval_tools.save_csv_rows(
+        output_csv_path=os.path.join("runs", "per_dataset_ai_evaluation_summary.csv"),
+        header=[
+            "dataset_name",
+            "total_sample_count",
+            "certain_prediction_sample_count",
+            "true_ai_sample_count",
+            "true_ai_certain_prediction_sample_count",
+            "true_ai_predicted_as_ai_sample_count",
+            "classification_accuracy_with_uncertainty",
+            "classification_accuracy_on_certain_samples",
+            "classification_certain_sample_coverage",
+            "classification_uncertainty_rate",
+            "ai_detection_accuracy_with_uncertainty",
+            "ai_detection_accuracy_on_certain_samples",
+            "ai_detection_certain_sample_coverage",
+        ],
+        rows=per_dataset_rows,
+        success_message="Saved per-dataset AI evaluation summary to %s",
+        logger=LOGGER,
+    )
+
+    # [1.4] 按数据集 + 按生成器导出细分指标。
+    eval_tools.save_csv_rows(
+        output_csv_path=os.path.join("runs", "per_dataset_per_ai_generator_evaluation_summary.csv"),
+        header=[
+            "dataset_name",
+            "ground_truth_ai_generator_name",
+            "true_ai_sample_count",
+            "true_ai_certain_prediction_sample_count",
+            "true_ai_predicted_as_ai_sample_count",
+            "ai_detection_accuracy_with_uncertainty",
+            "ai_detection_accuracy_on_certain_samples",
+            "ai_detection_certain_sample_coverage",
+        ],
+        rows=per_dataset_per_generator_rows,
+        success_message="Saved per-dataset per-AI-generator summary to %s",
+        logger=LOGGER,
+    )
+
+    # [1.6-日志摘要] 仅在对应 summary 字典非空时打印。
+    if summary_classification_accuracy_with_uncertainty_logs:
         LOGGER.info(
-            "[%s] acc_certain=%.4f, all_acc=%.4f, coverage=%.4f, uncertain_rate=%.4f",
-            ds_name, acc_certain, all_acc, coverage, uncertain_rate
+            "Per-dataset classification_accuracy_with_uncertainty: %s",
+            {k: round(v, 6) for k, v in summary_classification_accuracy_with_uncertainty_logs.items()},
+        )
+    if summary_classification_accuracy_on_certain_samples_logs:
+        LOGGER.info(
+            "Per-dataset classification_accuracy_on_certain_samples: %s",
+            {k: round(v, 6) for k, v in summary_classification_accuracy_on_certain_samples_logs.items()},
+        )
+    if summary_classification_uncertainty_rate_logs:
+        LOGGER.info(
+            "Per-dataset classification_uncertainty_rate: %s",
+            {k: round(v, 6) for k, v in summary_classification_uncertainty_rate_logs.items()},
+        )
+    if summary_ai_detection_accuracy_with_uncertainty_logs:
+        LOGGER.info(
+            "Per-dataset ai_detection_accuracy_with_uncertainty: %s",
+            {k: round(v, 6) for k, v in summary_ai_detection_accuracy_with_uncertainty_logs.items()},
+        )
+    if summary_ai_detection_accuracy_on_certain_samples_logs:
+        LOGGER.info(
+            "Per-dataset ai_detection_accuracy_on_certain_samples: %s",
+            {k: round(v, 6) for k, v in summary_ai_detection_accuracy_on_certain_samples_logs.items()},
+        )
+    overall_classification_accuracy_with_uncertainty = float("nan")
+    overall_classification_accuracy_on_certain_samples = float("nan")
+    overall_classification_certain_sample_coverage = float("nan")
+    overall_classification_uncertainty_rate = float("nan")
+    overall_ai_detection_accuracy_with_uncertainty = float("nan")
+    overall_ai_detection_accuracy_on_certain_samples = float("nan")
+    overall_ai_detection_certain_sample_coverage = float("nan")
+    overall_true_ai_sample_count = 0
+    overall_true_ai_certain_sample_count = 0
+    overall_true_ai_samples_predicted_as_ai_count = 0
+
+    # [1.5-overall] 先算 uncertain 比率与 certain 覆盖率。
+    if all_labels_total:
+        total_sample_count = len(all_labels_total)
+        overall_classification_uncertainty_rate = float(np.mean(np.asarray(all_uncertainty_flags, dtype=int)))
+        overall_classification_certain_sample_coverage = 1.0 - overall_classification_uncertainty_rate
+        LOGGER.info(
+            "Overall classification_certain_sample_coverage=%.4f, classification_uncertainty_rate=%.4f (samples=%d)",
+            overall_classification_certain_sample_coverage,
+            overall_classification_uncertainty_rate,
+            total_sample_count,
         )
 
-        all_labels_total.extend(y_test_np.tolist())
-        all_preds_total.extend(preds.astype(int).tolist())
-        all_uncertain_flags.extend(uncertain_mask.astype(int).tolist())
-        if certain_mask.any():
-            all_labels_certain.extend(y_test_np[certain_mask].tolist())
-            all_preds_certain.extend(preds[certain_mask].tolist())
+    # [1.5-overall] 在全样本上算二分类准确率，并在真实 AI 子集上算检测指标。
+    if all_labels_total and all_predictions_total:
+        labels_all_np = np.asarray(all_labels_total, dtype=int)
+        predictions_all_np = np.asarray(all_predictions_total, dtype=int)
+        overall_classification_accuracy_with_uncertainty = float((labels_all_np == predictions_all_np).mean())
+        LOGGER.info(
+            "Overall classification_accuracy_with_uncertainty: %.4f (samples=%d)",
+            overall_classification_accuracy_with_uncertainty,
+            len(labels_all_np),
+        )
+        (
+            overall_ai_detection_accuracy_with_uncertainty,
+            overall_ai_detection_accuracy_on_certain_samples,
+            overall_ai_detection_certain_sample_coverage,
+            overall_true_ai_sample_count,
+            overall_true_ai_certain_sample_count,
+        ) = eval_tools.compute_ai_detection_metrics(
+            predicted_is_ai=predictions_all_np,
+            true_ai_mask=(labels_all_np == 1),
+        )
+        LOGGER.info(
+            "Overall ai_detection_accuracy_with_uncertainty=%.4f, "
+            "ai_detection_accuracy_on_certain_samples=%.4f, ai_detection_certain_sample_coverage=%.4f "
+            "(true_ai_samples=%d, true_ai_certain_samples=%d)",
+            overall_ai_detection_accuracy_with_uncertainty,
+            overall_ai_detection_accuracy_on_certain_samples,
+            overall_ai_detection_certain_sample_coverage,
+            overall_true_ai_sample_count,
+            overall_true_ai_certain_sample_count,
+        )
 
-        # generator accuracy：只在真实 AI 样本上统计（nature 没有 generator 语义）
-        try:
-            ga_np = np.asarray([str(x) for x in gen_a], dtype=object)
-            gg_np = np.asarray([str(x) for x in gt_gen], dtype=object)
-            is_ai = (y_test_np == 1)
-            is_tp_ai = is_ai & (preds == 1)
-            n_ai = int(is_ai.sum())
-            n_tp_ai = int(is_tp_ai.sum())
-            gen_acc_ai = float((ga_np[is_ai] == gg_np[is_ai]).mean()) if n_ai else float("nan")
-            gen_acc_tp = float((ga_np[is_tp_ai] == gg_np[is_tp_ai]).mean()) if n_tp_ai else float("nan")
-            genacc_logs[ds_name] = gen_acc_ai
-            LOGGER.info(
-                "[%s] gen_acc(gt_ai)=%.4f (n=%d) | gen_acc(tp_ai)=%.4f (n=%d)",
-                ds_name,
-                gen_acc_ai,
-                n_ai,
-                gen_acc_tp,
-                n_tp_ai,
+    # [1.5-overall] 在 certain 子集上单独计算分类准确率。
+    if all_labels_on_certain_samples:
+        labels_on_certain_samples_np = np.asarray(all_labels_on_certain_samples, dtype=int)
+        predictions_on_certain_samples_np = np.asarray(all_predictions_on_certain_samples, dtype=int)
+        overall_classification_accuracy_on_certain_samples = float(
+            (labels_on_certain_samples_np == predictions_on_certain_samples_np).mean()
+        )
+        LOGGER.info(
+            "Overall classification_accuracy_on_certain_samples: %.4f (samples=%d)",
+            overall_classification_accuracy_on_certain_samples,
+            len(labels_on_certain_samples_np),
+        )
+
+    # [1.5-overall] 全局按 generator 细分统计 AI 检测指标。
+    if all_ground_truth_generators and all_ground_truth_is_ai_flags:
+        # 把列表转成 numpy，便于做掩码切片统计。
+        ground_truth_generator_np = np.asarray(all_ground_truth_generators, dtype=object)
+        ground_truth_is_ai_mask = np.asarray(all_ground_truth_is_ai_flags, dtype=int) == 1
+        predictions_all_np = np.asarray(all_predictions_total, dtype=int)
+        predicted_is_ai_mask = predictions_all_np == 1
+
+        # 样本长度必须一致，否则说明上游聚合逻辑错位，直接显式报错。
+        if len(predictions_all_np) != len(ground_truth_generator_np):
+            raise RuntimeError("Global prediction length does not match global generator label length.")
+
+        # 仅保留计数：真实 AI 中有多少被判为 AI。
+        true_ai_samples_predicted_as_ai_mask = ground_truth_is_ai_mask & predicted_is_ai_mask
+        overall_true_ai_samples_predicted_as_ai_count = int(true_ai_samples_predicted_as_ai_mask.sum())
+
+        # [1.5-overall] 逐 generator 统计（全局口径）。
+        unique_generators = sorted(
+            {str(x) for x in ground_truth_generator_np[ground_truth_is_ai_mask].tolist()}
+        ) if int(ground_truth_is_ai_mask.sum()) > 0 else []
+        for generator_name in unique_generators:
+            generator_true_ai_mask = ground_truth_is_ai_mask & (ground_truth_generator_np == generator_name)
+            (
+                generator_ai_detection_accuracy_with_uncertainty,
+                generator_ai_detection_accuracy_on_certain_samples,
+                generator_ai_detection_certain_sample_coverage,
+                generator_true_ai_sample_count,
+                generator_true_ai_certain_sample_count,
+            ) = eval_tools.compute_ai_detection_metrics(
+                predicted_is_ai=predictions_all_np,
+                true_ai_mask=generator_true_ai_mask,
             )
-            all_gen_gt.extend(gg_np.tolist())
-            all_gen_pred.extend(ga_np.tolist())
-            all_gen_is_ai.extend(is_ai.astype(int).tolist())
-            all_gen_is_tp_ai.extend(is_tp_ai.astype(int).tolist())
-        except Exception as e:
-            LOGGER.warning("[%s] Failed to compute generator accuracy: %s", ds_name, e)
 
-        for path, sa, sb, yt, pr, ga, gc, nb, ggt, dgt, m_raw, m_adj, gate, un in zip(
-            paths, test_scores_a_np, test_scores_b_np, y_test_np, preds, gen_a, gen_a_conf, nat_b, gt_gen, gt_ds,
-            raw_margin, adj_margin, conf_gate, uncertain_mask
-        ):
-            rel = (sa - sb) / (abs(sb) + 1e-8)
-            sym = (sa - sb) / (abs(sa) + abs(sb) + 1e-8)
-            if int(pr) == 1:
-                pred_gen = ga
-                pred_label = "ai"
-            elif int(pr) == 0:
-                pred_gen = "nature"
-                pred_label = "nature"
-            else:
-                pred_gen = "uncertain"
-                pred_label = "uncertain"
-            csv_rows.append([
-                ds_name, path, sa, sb, rel, sym, yt, pr, pred_label, int(un),
-                float(m_raw), float(m_adj), float(gate), pred_gen, ga, gc, nb, ggt, dgt
+            generator_true_ai_predicted_as_ai_mask = generator_true_ai_mask & predicted_is_ai_mask
+            generator_true_ai_predicted_as_ai_count = int(generator_true_ai_predicted_as_ai_mask.sum())
+
+            overall_per_generator_rows.append([
+                generator_name,
+                generator_true_ai_sample_count,
+                generator_true_ai_certain_sample_count,
+                generator_true_ai_predicted_as_ai_count,
+                generator_ai_detection_accuracy_with_uncertainty,
+                generator_ai_detection_accuracy_on_certain_samples,
+                generator_ai_detection_certain_sample_coverage,
             ])
 
+    # [1.4] 保存 overall 汇总（单行）。
+    eval_tools.save_csv_rows(
+        output_csv_path=os.path.join("runs", "overall_ai_evaluation_summary.csv"),
+        header=[
+            "classification_accuracy_with_uncertainty",
+            "classification_accuracy_on_certain_samples",
+            "classification_certain_sample_coverage",
+            "classification_uncertainty_rate",
+            "ai_detection_accuracy_with_uncertainty",
+            "ai_detection_accuracy_on_certain_samples",
+            "ai_detection_certain_sample_coverage",
+            "true_ai_sample_count",
+            "true_ai_certain_prediction_sample_count",
+            "true_ai_predicted_as_ai_sample_count",
+        ],
+        rows=[[
+            overall_classification_accuracy_with_uncertainty,
+            overall_classification_accuracy_on_certain_samples,
+            overall_classification_certain_sample_coverage,
+            overall_classification_uncertainty_rate,
+            overall_ai_detection_accuracy_with_uncertainty,
+            overall_ai_detection_accuracy_on_certain_samples,
+            overall_ai_detection_certain_sample_coverage,
+            overall_true_ai_sample_count,
+            overall_true_ai_certain_sample_count,
+            overall_true_ai_samples_predicted_as_ai_count,
+        ]],
+        success_message="Saved overall AI evaluation summary to %s",
+        logger=LOGGER,
+    )
 
-    # 保存每个测试样本的两个原始分数到 CSV（覆盖全部 test 样本）
-    try:
-        if csv_rows:
-            os.makedirs("runs", exist_ok=True)
-            out_csv = os.path.join("runs", "test_scores.csv")
-            with open(out_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                header = [
-                    "dataset",
-                    "id",
-                    "score_ai",
-                    "score_nature",
-                    "rel_diff_to_b",
-                    "sym_diff",
-                    "label_is_ai",
-                    "pred_is_ai",
-                    "pred_label",
-                    "is_uncertain",
-                    "margin_raw",
-                    "margin_adj",
-                    "ai_conf_gate",
-                    "pred_generator",
-                    "ai_generator",
-                    "ai_generator_conf",
-                    "nature_label",
-                    "gt_generator",
-                    "gt_dataset_name",
-                ]
-                writer.writerow(header)
-                writer.writerows(csv_rows)
-            LOGGER.info("Saved per-image test scores to %s", out_csv)
-    except Exception as e:
-        LOGGER.warning("Failed to save per-image test scores: %s", e)
-
-    # 打印 summary 与全局精度
-    try:
-        if summary_certainacc_logs:
-            LOGGER.info("Per-dataset acc_certain: %s", {k: round(v, 6) for k, v in summary_certainacc_logs.items()})
-        if summary_allacc_logs:
-            LOGGER.info("Per-dataset all_acc: %s", {k: round(v, 6) for k, v in summary_allacc_logs.items()})
-        if summary_uncertain_logs:
-            LOGGER.info("Per-dataset uncertain_rate: %s", {k: round(v, 6) for k, v in summary_uncertain_logs.items()})
-    except Exception:
-        pass
-
-    try:
-        if genacc_logs:
-            LOGGER.info("Per-dataset gen_acc(gt_ai): %s", {k: round(v, 6) for k, v in genacc_logs.items()})
-    except Exception:
-        pass
-
-    try:
-        if all_labels_total:
-            total_samples = len(all_labels_total)
-            uncertain_rate = float(np.mean(np.asarray(all_uncertain_flags, dtype=int)))
-            coverage = 1.0 - uncertain_rate
-            LOGGER.info("Overall coverage=%.4f, uncertain_rate=%.4f (samples=%d)", coverage, uncertain_rate, total_samples)
-        if all_labels_total and all_preds_total:
-            labels_all_np = np.asarray(all_labels_total, dtype=int)
-            preds_all_np = np.asarray(all_preds_total, dtype=int)
-            overall_all_acc = float((labels_all_np == preds_all_np).mean())
-            LOGGER.info("Overall all_acc: %.4f (samples=%d)", overall_all_acc, len(labels_all_np))
-
-        if all_labels_certain:
-            labels_np = np.array(all_labels_certain, dtype=int)
-            preds_np = np.array(all_preds_certain, dtype=int)
-            overall_acc = float((labels_np == preds_np).mean())
-            LOGGER.info("Overall acc_certain: %.4f (samples=%d)", overall_acc, len(labels_np))
-    except Exception as e:
-        LOGGER.warning("Failed to compute overall metrics: %s", e)
-
-    # overall generator accuracy
-    try:
-        if all_gen_gt and all_gen_pred and all_gen_is_ai:
-            gg = np.asarray(all_gen_gt, dtype=object)
-            ga = np.asarray(all_gen_pred, dtype=object)
-            is_ai = np.asarray(all_gen_is_ai, dtype=int) == 1
-            is_tp_ai = np.asarray(all_gen_is_tp_ai, dtype=int) == 1
-            n_ai = int(is_ai.sum())
-            n_tp_ai = int(is_tp_ai.sum())
-            gen_acc_ai = float((ga[is_ai] == gg[is_ai]).mean()) if n_ai else float("nan")
-            gen_acc_tp = float((ga[is_tp_ai] == gg[is_tp_ai]).mean()) if n_tp_ai else float("nan")
-            LOGGER.info("Overall gen_acc(gt_ai)=%.4f (n=%d) | gen_acc(tp_ai)=%.4f (n=%d)", gen_acc_ai, n_ai, gen_acc_tp, n_tp_ai)
-    except Exception as e:
-        LOGGER.warning("Failed to compute overall generator accuracy: %s", e)
+    # [1.4] 保存 overall 按 generator 细分汇总。
+    eval_tools.save_csv_rows(
+        output_csv_path=os.path.join("runs", "overall_per_ai_generator_evaluation_summary.csv"),
+        header=[
+            "ground_truth_ai_generator_name",
+            "true_ai_sample_count",
+            "true_ai_certain_prediction_sample_count",
+            "true_ai_predicted_as_ai_sample_count",
+            "ai_detection_accuracy_with_uncertainty",
+            "ai_detection_accuracy_on_certain_samples",
+            "ai_detection_certain_sample_coverage",
+        ],
+        rows=overall_per_generator_rows,
+        success_message="Saved overall per-AI-generator summary to %s",
+        logger=LOGGER,
+    )
 
 
 if __name__ == "__main__":
@@ -652,13 +789,13 @@ if __name__ == "__main__":
     # 数据
     parser.add_argument("--data_path", type=str, default=os.path.expanduser("~/datasets/tiny_genimage"))
     parser.add_argument("--dataset_names", nargs="+", default=[
-        # 'adm',
-        # 'biggan', 
+        'adm',
+        'biggan', 
         'glide', 
         'midjourney', 
         'sdv5', 
-        # 'vqdm', 
-        # 'wukong',
+        'vqdm', 
+        'wukong',
         # 'Chameleon',
         # 'sdv5_bigval',
         # 'sdv5 mini', 
@@ -666,15 +803,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test_dataset_names",
         nargs="+",
-        # default=None,
         default=[
-        # 'adm',
-        # 'biggan', 
+        'adm',
+        'biggan', 
         'glide', 
         'midjourney', 
         'sdv5', 
-        # 'vqdm', 
-        # 'wukong',
+        'vqdm', 
+        'wukong',
         # 'Chameleon',
         # 'sdv5_bigval',
         # 'sdv5 mini', 
@@ -717,7 +853,7 @@ if __name__ == "__main__":
                         help="预处理输出维度；设为 0 时按选定层的通道数自动推断")
     parser.add_argument("--target_embed_dimension", type=int, default=512)
     parser.add_argument("--patchsize", type=int, default=3, help="兼容参数（当前图像级聚合，不切 patch）")
-    parser.add_argument("--anomaly_scorer_k", type=int, default=20)
+    parser.add_argument("--anomaly_scorer_k", type=int, default=20, help="异常分数计算时使用的 k 值")
 
     # 阶段控制与模型保存
     parser.add_argument(
@@ -734,13 +870,7 @@ if __name__ == "__main__":
 
 
     # sampler / coreset
-    parser.add_argument("--sampler_name", 
-                        # default="central",
-                        # default="central_mahal",
-                        # default="density",
-                        default="random",
-                        # default="pca"
-                        )
+    parser.add_argument("--sampler_name", default="random",)
     parser.add_argument("--coreset_percentage", type=float, default=0.1)
     # FAISS / 设备
     parser.add_argument("--faiss_on_gpu", action="store_true")
@@ -749,7 +879,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ai_conf_floor",
         type=float,
-        default=0.35,
+        default=0,
         help="将 ai_generator_conf 融入分类 margin 时的最小保留权重（0~1，越小越依赖 conf）。",
     )
     parser.add_argument(

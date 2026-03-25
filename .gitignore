@@ -1,12 +1,5 @@
 __pycache__/
 
-
-visualization
-adaption
-
-memorybanks
-classifier
-
 # 文件夹
 runs/*
 models/*
@@ -14,4 +7,3 @@ Report/*
 memorybanks/*
 classifier/*
 output_images/*
-output_images*

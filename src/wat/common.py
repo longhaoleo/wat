@@ -1,3 +1,12 @@
+"""
+WAT 公共组件模块。
+
+本文件对应 `PROJECT_DETAILED_COMMENTS.md` 第 4 节：
+1) 检索器：`BruteNN` / `FaissNN`；
+2) 特征处理：`Preprocessing` / `Aggregator` / `NetworkFeatureAggregator`；
+3) 评分器：`NearestNeighbourScorer`（fit/predict/vote）。
+"""
+
 import copy
 import os
 import pickle
@@ -21,6 +30,7 @@ METRIC = "l2"
 
 # 加入L2归一化
 def _l2_normalize_np(x, eps=1e-12):
+    """按行做 L2 归一化，避免向量尺度差异主导 KNN 距离。"""
     n = np.linalg.norm(x, axis=1, keepdims=True)   # 按行求范数
     n = np.maximum(n, eps)
     return x / n
@@ -153,6 +163,7 @@ class BruteNN(object):
         query_features: np.ndarray,
         index_features: np.ndarray = None,
     ) -> Union[np.ndarray, np.ndarray, np.ndarray]:
+        # run(...) 统一返回 (nn_dists, nn_indices)，与 faiss.search 口径一致。
         index = np.asarray(index_features if index_features is not None else self.index_features, dtype=np.float32)
         query = np.asarray(query_features, dtype=np.float32)
         if index is None:
@@ -213,6 +224,7 @@ class FaissNN(object):
         return faiss.IndexFlatL2(dimension)
 
     def fit(self, features: np.ndarray) -> None:
+        # 每次 fit 都重建索引，确保不会混入旧实验特征。
         if self.search_index:
             self.reset_index()
         self.search_index = self._create_index(features.shape[-1])
@@ -523,7 +535,11 @@ class Aggregator(torch.nn.Module):
 
 
 class NetworkFeatureAggregator(torch.nn.Module):
-    """高效的网络特征提取"""
+    """
+    网络中间层特征提取器。
+
+    通过 forward hook 抓取指定层输出，并在最后一层后提前中断前向，减少无效计算。
+    """
 
     def __init__(self, backbone, layers_to_extract_from, device):
         super(NetworkFeatureAggregator, self).__init__()
@@ -544,6 +560,7 @@ class NetworkFeatureAggregator(torch.nn.Module):
             handle.remove()
         self.outputs = {}  # 用于存储中间特征
 
+        # 按配置逐层注册 hook，输出存到 self.outputs。
         for extract_layer in layers_to_extract_from:
             forward_hook = ForwardHook(
                 self.outputs, extract_layer, layers_to_extract_from[-1]
@@ -588,7 +605,7 @@ class NetworkFeatureAggregator(torch.nn.Module):
 
 
     def forward(self, images):
-        """前向传播，提取特征"""
+        """执行 backbone 前向并收集 hook 输出。"""
         self.outputs.clear()
         with torch.no_grad():
             try:
@@ -672,9 +689,11 @@ class NearestNeighbourScorer(object):
         # 与 detection_features 行对齐的数据集标签
         self.detection_dataset_labels: Optional[np.ndarray] = None
 
-        # 图像级别的最近邻搜索函数
+        # 图像级别的最近邻搜索函数。
+        # 注意这里使用 self.n_nearest_neighbours（而不是构造入参的闭包常量），
+        # 以支持运行时调整 top-k。
         self.imagelevel_nn = lambda query: self.nn_method.run(
-            n_nearest_neighbours, query
+            self.n_nearest_neighbours, query
         )
         # 像素级别的最近邻搜索函数
         self.pixelwise_nn = lambda query, index: self.nn_method.run(1, query, index)
@@ -691,9 +710,11 @@ class NearestNeighbourScorer(object):
             detection_features: 训练图像的特征列表，每个特征对应于某个图像的特征向量
             detection_labels: 可选，每个特征行对应的数据集名称
         """
+        # 1) 把多组特征合并为单个二维矩阵 [N, D_total]。
         self.detection_features = self.feature_merger.merge(
             detection_features,  # 合并所有训练图像的特征，分层 N ，每层将特征压成一维
         )
+        # 2) L2 归一化后再建索引，确保距离可比。
         self.detection_features = _l2_normalize_np(self.detection_features)
         if detection_labels is None:
             detection_labels = np.array(["unknown"] * len(self.detection_features))
@@ -701,25 +722,39 @@ class NearestNeighbourScorer(object):
         if detection_labels.shape[0] != self.detection_features.shape[0]:
             raise ValueError("detection_labels length must match detection_features rows.")
         self.detection_dataset_labels = detection_labels
-        self.nn_method.fit(self.detection_features)  # 用合并后的特征训练最近邻模型，一维向量
+        # 3) 训练近邻索引（Brute 或 Faiss）。
+        self.nn_method.fit(self.detection_features)
 
 
     def predict(
         self, query_features: List[np.ndarray]
-    ) -> Union[np.ndarray, np.ndarray, np.ndarray, List[str], List[float], List[int], List[int]]:
+    ) -> Union[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        List[str],
+        List[float],
+        List[int],
+        List[int],
+        List[float],
+        List[float],
+        List[float],
+        List[float],
+    ]:
         """
         预测异常分数
         参数:
             detection_query_features: 测试图像的特征列表
         """
+        # 1) 查询特征使用与训练同样的 merge + normalize 口径。
         query_features = self.feature_merger.merge(
             query_features,  # 合并测试图像的特征
         )  # query_features：[N_patches_total, 512]
         query_features = _l2_normalize_np(query_features)
         query_distances, query_nns = self.imagelevel_nn(query_features)  # 查询最近邻
 
-        # 仅使用 L2 距离：TopK 距离均值映射到 [0,1] 异常分数。
-        # 由于前面已做 L2 归一化，距离理论上在 [0, 2]，故除以 2 即可映射到 [0,1]。
+        # 2) 异常分数定义：TopK L2 距离均值，再映射到 [0,1]。
+        #    归一化向量的 L2 距离理论范围约 [0, 2]，所以这里除以 2。
         mean_dists = query_distances.mean(axis=-1)
         anomaly_scores = np.clip(mean_dists / 2.0, 0.0, 1.0)
 
@@ -727,23 +762,69 @@ class NearestNeighbourScorer(object):
         pred_label_confs: List[float] = []
         pred_label_counts: List[int] = []
         pred_label_unique: List[int] = []
+        pred_label_base_confs: List[float] = []
+        pred_label_diversity_penalties: List[float] = []
+        pred_label_entropy_normalized: List[float] = []
+        pred_label_unique_ratios: List[float] = []
+        # 3) 若索引保存了标签，则额外返回 TopK 投票标签与置信度。
         if self.detection_dataset_labels is not None:
             for row_idx, nn_row in enumerate(query_nns):
                 labels = self.detection_dataset_labels[nn_row]
                 dists = query_distances[row_idx]
-                best_label, conf, best_count, n_unique = self._vote_label(labels=labels, dists=dists)
+                (
+                    best_label,
+                    conf,
+                    best_count,
+                    n_unique,
+                    base_conf,
+                    diversity_penalty,
+                    entropy_normalized,
+                    unique_ratio,
+                ) = self._vote_label(labels=labels, dists=dists)
                 pred_labels.append(best_label)
                 pred_label_confs.append(conf)
                 pred_label_counts.append(best_count)
                 pred_label_unique.append(n_unique)
+                pred_label_base_confs.append(base_conf)
+                pred_label_diversity_penalties.append(diversity_penalty)
+                pred_label_entropy_normalized.append(entropy_normalized)
+                pred_label_unique_ratios.append(unique_ratio)
 
-        return anomaly_scores, query_distances, query_nns, pred_labels, pred_label_confs, pred_label_counts, pred_label_unique
+        return (
+            anomaly_scores,
+            query_distances,
+            query_nns,
+            pred_labels,
+            pred_label_confs,
+            pred_label_counts,
+            pred_label_unique,
+            pred_label_base_confs,
+            pred_label_diversity_penalties,
+            pred_label_entropy_normalized,
+            pred_label_unique_ratios,
+        )
 
-    def _vote_label(self, *, labels: np.ndarray, dists: np.ndarray) -> tuple[str, float, int, int]:
+    def _vote_label(
+        self,
+        *,
+        labels: np.ndarray,
+        dists: np.ndarray,
+    ) -> tuple[str, float, int, int, float, float, float, float]:
         """
         TopK label 投票（距离权重 + 数量加成）并返回惩罚后的置信度。
-        返回: (best_label, conf, best_count, n_unique)
+        返回:
+          (
+            best_label,
+            conf_after_penalty,
+            best_count,
+            n_unique,
+            base_conf_before_penalty,
+            diversity_penalty,
+            entropy_normalized,
+            unique_ratio,
+          )
         """
+        # 先把距离转成权重：越近权重越大。
         weights = self._weights_from_dists(dists)
 
         weight_sum_by_label: Dict[str, float] = {}
@@ -754,8 +835,9 @@ class NearestNeighbourScorer(object):
             count_by_label[k] = count_by_label.get(k, 0) + 1
 
         if not weight_sum_by_label:
-            return "unknown", float("nan"), 0, 0
+            return "unknown", float("nan"), 0, 0, float("nan"), float("nan"), float("nan"), float("nan")
 
+        # 距离权重与出现次数共同决定分数：频次高且距离近的标签更优。
         scored = {
             k: weight_sum_by_label[k] * (count_by_label[k] ** self.label_count_power)
             for k in weight_sum_by_label.keys()
@@ -765,9 +847,19 @@ class NearestNeighbourScorer(object):
         denom = float(sum(scored.values())) + self.weight_eps
         base_conf = best_score / denom
 
-        penalty, _, _ = self._diversity_penalty(scored=scored, k=len(dists))
+        # 邻居标签越杂，置信度惩罚越强（但不会改变 argmax 标签）。
+        penalty, entropy_normalized, unique_ratio = self._diversity_penalty(scored=scored, k=len(dists))
         conf = float(np.clip(base_conf * penalty, 0.0, 1.0))
-        return best_label, conf, int(count_by_label.get(best_label, 0)), int(len(count_by_label))
+        return (
+            best_label,
+            conf,
+            int(count_by_label.get(best_label, 0)),
+            int(len(count_by_label)),
+            float(base_conf),
+            float(penalty),
+            float(entropy_normalized),
+            float(unique_ratio),
+        )
 
     def _weights_from_dists(self, dists: np.ndarray) -> np.ndarray:
         # 仅使用 L2 距离：距离越小，权重越大。

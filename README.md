@@ -310,19 +310,81 @@ python ./bin/run_wat.py \
 
 ### 7.1 终端指标
 
-- 数据集级：`acc(certain)`、`coverage`、`uncertain_rate`
-- generator：`gen_acc(gt_ai)`、`gen_acc(tp_ai)`
-- 全局：`Overall coverage`、`Overall accuracy(certain)`、分类别 `P/R/F1`
+当前代码（`bin/run_wat.py` + `src/wat/eval_tools.py`）会打印三层指标：
 
-### 7.2 CSV（`runs/test_scores.csv`）
+1) 数据集级（Per-dataset）  
+2) 全局级（Overall）  
+3) 全局按 generator 分组（Overall per generator）
 
-主要字段：
+下面是每个指标的**详细口径**（名称与代码保持一致）：
 
-- 分数：`score_ai`, `score_nature`
-- 二分类：`pred_is_ai`（`1/0/-1`），`pred_label`（`ai/nature/uncertain`）
-- 融合与不确定性：`margin_raw`, `margin_adj`, `ai_conf_gate`, `is_uncertain`
-- 归属：`pred_generator`, `ai_generator`, `ai_generator_conf`, `nature_label`
-- 真值：`label_is_ai`, `gt_generator`, `gt_dataset_name`
+说明：公式里的代码变量 `label_is_ai / pred_is_ai`，在 `test_scores.csv` 中分别对应
+`ground_truth_is_ai / predicted_is_ai_with_uncertainty`。
+
+- `classification_accuracy_with_uncertainty`
+  - 含义：二分类总体准确率（`ai` vs `nature`），把 `uncertain` 当作错误。
+  - 公式：`mean(pred_is_ai == label_is_ai)`，其中 `pred_is_ai in {1,0,-1}`，`label_is_ai in {1,0}`。
+  - 注意：因为 `-1` 永远不等于真值标签 `0/1`，所以会拉低该值。
+
+- `classification_accuracy_on_certain_samples`
+  - 含义：仅在“模型给出确定判断”的样本上统计二分类准确率。
+  - 过滤：`pred_is_ai != -1`。
+  - 公式：`mean(pred_is_ai == label_is_ai | pred_is_ai != -1)`。
+
+- `classification_certain_sample_coverage`
+  - 含义：模型给出确定判断（非 uncertain）的覆盖率。
+  - 公式：`mean(pred_is_ai != -1)`。
+
+- `classification_uncertainty_rate`
+  - 含义：不确定率。
+  - 公式：`1 - classification_certain_sample_coverage`。
+
+- `ai_detection_accuracy_with_uncertainty`
+  - 含义：在真实 AI 样本上，“是否判为 AI”的准确率；`uncertain` 记错。
+  - 样本子集：`label_is_ai == 1`。
+  - 正确条件：`pred_is_ai == 1`。
+  - 公式：`mean(pred_is_ai == 1 | label_is_ai == 1)`。
+
+- `ai_detection_accuracy_on_certain_samples`
+  - 含义：在真实 AI 且 certain 的子集上，“是否判为 AI”的准确率。
+  - 样本子集：`label_is_ai == 1` 且 `pred_is_ai != -1`。
+  - 公式：`mean(pred_is_ai == 1 | label_is_ai == 1, pred_is_ai != -1)`。
+
+- `ai_detection_certain_sample_coverage`
+  - 含义：真实 AI 样本中，被模型“确定给出 ai/nature”判断的覆盖率。
+  - 样本子集：`label_is_ai == 1`。
+  - 公式：`count(label_is_ai == 1 and pred_is_ai != -1) / count(label_is_ai == 1)`。
+
+配套样本计数字段（日志和 CSV 中会出现）：
+- `total_sample_count`
+- `certain_prediction_sample_count`
+- `true_ai_sample_count`
+- `true_ai_certain_prediction_sample_count`
+- `true_ai_predicted_as_ai_sample_count`
+
+### 7.2 CSV 输出文件
+
+当前会输出 5 个 CSV：
+
+1) `runs/test_scores.csv`（逐样本明细）  
+完整列名（按顺序）：
+`dataset_name,image_path,anomaly_score_from_ai_bank,anomaly_score_from_nature_bank,relative_difference_to_nature_score,symmetric_score_difference,ground_truth_is_ai,predicted_is_ai_with_uncertainty,predicted_label_text,uncertainty_flag,raw_margin_nature_minus_ai,confidence_adjusted_margin_nature_minus_ai,ai_confidence_gate_weight,predicted_generator_for_final_label,predicted_generator_from_ai_bank,predicted_generator_confidence_from_ai_bank,predicted_generator_base_confidence_before_diversity_penalty,predicted_generator_diversity_penalty,topk_unique_label_count,topk_entropy_normalized,topk_unique_ratio,predicted_label_from_nature_bank,ground_truth_generator_name,ground_truth_dataset_name`
+
+2) `runs/per_dataset_ai_evaluation_summary.csv`（按数据集汇总）  
+完整列名（按顺序）：
+`dataset_name,total_sample_count,certain_prediction_sample_count,true_ai_sample_count,true_ai_certain_prediction_sample_count,true_ai_predicted_as_ai_sample_count,classification_accuracy_with_uncertainty,classification_accuracy_on_certain_samples,classification_certain_sample_coverage,classification_uncertainty_rate,ai_detection_accuracy_with_uncertainty,ai_detection_accuracy_on_certain_samples,ai_detection_certain_sample_coverage`
+
+3) `runs/per_dataset_per_ai_generator_evaluation_summary.csv`（按数据集、按 generator 汇总）  
+完整列名（按顺序）：
+`dataset_name,ground_truth_ai_generator_name,true_ai_sample_count,true_ai_certain_prediction_sample_count,true_ai_predicted_as_ai_sample_count,ai_detection_accuracy_with_uncertainty,ai_detection_accuracy_on_certain_samples,ai_detection_certain_sample_coverage`
+
+4) `runs/overall_ai_evaluation_summary.csv`（全局单行汇总）  
+完整列名（按顺序）：
+`classification_accuracy_with_uncertainty,classification_accuracy_on_certain_samples,classification_certain_sample_coverage,classification_uncertainty_rate,ai_detection_accuracy_with_uncertainty,ai_detection_accuracy_on_certain_samples,ai_detection_certain_sample_coverage,true_ai_sample_count,true_ai_certain_prediction_sample_count,true_ai_predicted_as_ai_sample_count`
+
+5) `runs/overall_per_ai_generator_evaluation_summary.csv`（全局按 generator 汇总）  
+完整列名（按顺序）：
+`ground_truth_ai_generator_name,true_ai_sample_count,true_ai_certain_prediction_sample_count,true_ai_predicted_as_ai_sample_count,ai_detection_accuracy_with_uncertainty,ai_detection_accuracy_on_certain_samples,ai_detection_certain_sample_coverage`
 
 ---
 

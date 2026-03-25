@@ -1,3 +1,16 @@
+"""
+骨干网络加载工具。
+
+职责：
+1) 维护可用 backbone 名称到“构造表达式”的映射；
+2) 兼容 timm / torchvision / open_clip 三类来源；
+3) 对外暴露统一入口 `load(name)`，让上层不用关心底层框架差异。
+
+对应 `PROJECT_DETAILED_COMMENTS.md` 第 7 节：
+- `_build_clip_backbone(...)`：创建 CLIP 视觉分支；
+- `load(...)`：统一路由到 timm / torchvision / open_clip。
+"""
+
 import timm  # noqa
 import torchvision.models as models  # noqa
 # import pretrainedmodels
@@ -7,6 +20,7 @@ import open_clip
 
 
 _BACKBONES = {
+    # 经典 CNN
     "alexnet": "models.alexnet(pretrained=True)",
     # 批归一化 + Inception 多尺度卷积
     "bninception": 'pretrainedmodels.__dict__["bninception"]'
@@ -29,14 +43,14 @@ _BACKBONES = {
     "vgg19_bn": "models.vgg19_bn(pretrained=True)",
     "wideresnet50": "models.wide_resnet50_2(pretrained=True)",
     "wideresnet101": "models.wide_resnet101_2(pretrained=True)",
-    # 轻量级
+    # 轻量级 CNN（移动端友好）
     "mnasnet_100": 'timm.create_model("mnasnet_100", pretrained=True)',
     "mnasnet_a1": 'timm.create_model("mnasnet_a1", pretrained=True)',
     "mnasnet_b1": 'timm.create_model("mnasnet_b1", pretrained=True)',
-    # 密集连接网络
+    # DenseNet：跨层特征复用
     "densenet121": 'timm.create_model("densenet121", pretrained=True)',
     "densenet201": 'timm.create_model("densenet201", pretrained=True)',
-    # 多尺度卷积融合 + 跳跃残差连接
+    # 多尺度结构
     "inception_v4": 'timm.create_model("inception_v4", pretrained=True)',
     "vit_small": 'timm.create_model("vit_small_patch16_224", pretrained=True)',
     "vit_base": 'timm.create_model("vit_base_patch16_224", pretrained=True)',
@@ -65,7 +79,11 @@ _CLIP_BACKBONES = {
 
 
 def _build_clip_backbone(name: str):
-    """构建 CLIP 视觉骨干（依赖 open_clip_torch）."""
+    """
+    构建 CLIP 视觉骨干（依赖 open_clip_torch）。
+
+    返回 `model.visual`，这样上层可以像普通 backbone 一样注册中间层 hook。
+    """
     if name not in _CLIP_BACKBONES:
         raise KeyError(f"Unknown CLIP backbone: {name}. Supported: {list(_CLIP_BACKBONES.keys())}")
 
@@ -84,8 +102,10 @@ def load(name: str):
         - 标准名称: 'resnet50', 'vit_base', ...
         - CLIP 视觉骨干: 'clip_vit_b16', 'clip_vit_b32'
     """
+    # 常规 timm/torchvision 骨干
     if name in _BACKBONES:
         model = eval(_BACKBONES[name])
+    # CLIP 视觉骨干（open_clip）
     elif name in _CLIP_BACKBONES:
         model = _build_clip_backbone(name)
     else:
