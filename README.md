@@ -11,7 +11,7 @@
 
 1. 用 backbone 提取图像 embedding（可多层融合）
 2. 分别在 `ai` 与 `nature` 记忆库做 KNN 检索，得到两个分数
-3. 用分数差做二分类，并用 `ai_generator_conf` 修正；落入不确定区间时输出 `uncertain`
+3. 当前默认直接用分数差做二分类；`ai_generator_conf` 门控接口保留，但默认不启用，相关研究留到后续再做；落入不确定区间时输出 `uncertain`
 
 具体定义：
 
@@ -45,7 +45,7 @@
 **输入**
 - query 图像 embedding：`q ∈ R^D`
 - 记忆库特征：`x_j ∈ R^D`
-- top-k：`k = --anomaly_scorer_k`（默认 20）
+- top-k：`k = --anomaly_scorer_k`（默认 5）
 
 **步骤 1：特征归一化**
 
@@ -152,6 +152,7 @@ conf = clip(base_conf * penalty, 0, 1)
 - `ai_generator_conf = conf`
 - `ai_generator_conf` 越低，说明 generator 归属越不稳定。
 
+
 ### 2.4 最终二分类规则
 
 对应 `bin/run_wat.py` 的推理主循环，逻辑是“先证据差，再置信度门控，再不确定筛除”。
@@ -172,11 +173,12 @@ gate = conf_floor + (1 - conf_floor) * clip(ai_generator_conf, 0, 1)
 adj_margin = raw_margin * gate
 ```
 
-默认 `conf_floor=0.35`，因此：
+当 `conf_floor < 1.0` 时：
 - `ai_generator_conf=1` -> `gate=1`（不衰减）
-- `ai_generator_conf=0` -> `gate=0.35`（只保留 35% 的 margin）
+- `ai_generator_conf` 越低，`gate` 越接近 `conf_floor`
+- `adj_margin` 会被压小，系统会更容易输出 `uncertain`
 
-这一步的作用是： 
+这一步的作用是：
 当 AI 归属本身不稳定（`ai_generator_conf` 低）时，把分类证据拉回到更保守的范围。
 
 **步骤 3：不确定区间判定**
@@ -190,7 +192,15 @@ else:
     pred_is_ai = 0    # nature
 ```
 
-默认 `uncertain_eps=0.01`。 
+当前默认 `conf_floor=1.0`，因此默认配置下：
+- `gate` 恒等于 `1`
+- 二分类直接使用 `raw_margin`
+- generator 置信度不会再压缩二分类 margin
+
+如果你手动把 `conf_floor` 调低，才会重新启用这一步的门控效果。
+当前版本默认不走这条分支，generator 置信度如何更有效地参与二分类，留到后续再系统研究。
+
+默认 `uncertain_eps=0.002`。 
 `eps` 越大，系统越保守，uncertain 比例越高，误报通常会下降但覆盖率会下降。
 
 **步骤 4：指标统计口径**
@@ -298,11 +308,11 @@ python ./bin/run_wat.py \
 ## 6. 关键参数
 
 - `--layers_to_extract_from`：多层特征配置（影响表征能力）
-- `--anomaly_scorer_k`：KNN 的 top-k
+- `--anomaly_scorer_k`：KNN 的 top-k（默认 `5`）
 - `--sampler_name` / `--coreset_percentage`：记忆库容量与速度平衡
 - `--nn_method`：`auto | flat | ivfpq`（faiss 可用时生效）
-- `--ai_conf_floor`：置信度融合下限（越小越依赖 `ai_generator_conf`）
-- `--uncertain_eps`：不确定区间阈值（越大越保守）
+- `--ai_conf_floor`：置信度融合下限（默认 `1.0`；越小越依赖 `ai_generator_conf`，`1.0` 表示不衰减 margin）
+- `--uncertain_eps`：不确定区间阈值（默认 `0.002`；越大越保守）
 
 ---
 

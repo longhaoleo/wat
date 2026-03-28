@@ -810,7 +810,6 @@ if __name__ == "__main__":
         'midjourney', 
         'sdv5', 
         'vqdm', 
-        'wukong',
         # 'Chameleon',
         # 'sdv5_bigval',
         # 'sdv5 mini', 
@@ -879,13 +878,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ai_conf_floor",
         type=float,
-        default=0,
-        help="将 ai_generator_conf 融入分类 margin 时的最小保留权重（0~1，越小越依赖 conf）。",
+        default=1.0,
+        help="将 ai_generator_conf 融入分类 margin 时的最小保留权重（0~1，越小越依赖 conf；1.0 表示不衰减 margin）。",
     )
     parser.add_argument(
         "--uncertain_eps",
         type=float,
-        default=0.01,
+        default=0.002,
         help="不确定区间阈值：|adjusted_margin| < eps 时输出 uncertain。",
     )
 
@@ -894,3 +893,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(args)
+                                                                                                                                
+                                                                                                                                 
